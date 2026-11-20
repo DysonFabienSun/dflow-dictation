@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing annotated version tag
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,10 +18,11 @@ jobs:
   release:
     runs-on: windows-2025
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Verify version and build DFlow
