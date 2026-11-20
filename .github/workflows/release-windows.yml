@@ -1,0 +1,61 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2025
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify version and build DFlow
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo metadata failed.' }
+          $version = ($metadata | ConvertFrom-Json).packages[0].version
+          if ($env:RELEASE_TAG -cne "v$version") {
+            throw "Tag $env:RELEASE_TAG does not match Cargo version v$version."
+          }
+
+          cargo build --locked --release --bin dflow
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo release build failed.' }
+
+      - name: Attach dflow.exe to a draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Restore the original tag object so gh can read its annotation.
+          $tagRef = "refs/tags/$env:RELEASE_TAG"
+          git fetch --force --no-tags origin "${tagRef}:${tagRef}"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the release tag.' }
+          $tagCommit = git rev-parse "${tagRef}^{commit}"
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne (git rev-parse HEAD)) {
+            throw 'The release tag does not match the source that was built.'
+          }
+
+          $objectType = git cat-file -t $tagRef
+          if ($LASTEXITCODE -ne 0 -or $objectType -cne 'tag') {
+            throw 'The release requires an annotated tag containing the changelog.'
+          }
+          [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+          $lines = git for-each-ref '--format=%(contents)' $tagRef
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the tag annotation.' }
+          $notes = ($lines -join "`n").TrimEnd("`r", "`n") + "`n"
+          if ([string]::IsNullOrWhiteSpace($notes)) { throw 'The changelog is empty.' }
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM -NoNewline
+
+          gh release create "$env:RELEASE_TAG" ./target/release/dflow.exe --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }

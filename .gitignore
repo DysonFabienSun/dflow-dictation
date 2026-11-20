@@ -1,3 +1,11 @@
-/ref-src/
+# Cargo build output
 /target/
-/config/dflow.toml
+
+# Local settings and test runs
+/AGENTS.md
+/config/
+/playtest/
+
+# Local reference material and archived icon previews
+/ref-src/
+/legacy/icon-previews/
