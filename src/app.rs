@@ -721,10 +721,12 @@ impl App {
                     revision,
                 } => {
                     use crate::agent::Edit;
-                    if matches!(operation, Edit::Replace) && revision.is_none() {
+                    if matches!(operation, Edit::Replace | Edit::InsertAfterLine { .. })
+                        && revision.is_none()
+                    {
                         return Err(Error::new(
                             "revision_required",
-                            "Read the note before replacing it.",
+                            "Read the note first and pass its revision.",
                         ));
                     }
                     if !self.panes.is_empty() || self.dictation.is_some() {
@@ -735,16 +737,17 @@ impl App {
                     }
                     check(revision, self.revision)?;
                     let text = clean_text(&text);
-                    changed = self.editor.edit(|editor| match operation {
-                        Edit::Append => editor.append(&text),
-                        Edit::Insert => {
+                    changed = match operation {
+                        Edit::Append => self.editor.edit(|editor| editor.append(&text)),
+                        Edit::Insert => self.editor.edit(|editor| {
                             if !text.is_empty() {
                                 editor.clear_selection();
                             }
                             editor.insert(&text)
-                        }
-                        Edit::Replace => editor.replace(text),
-                    });
+                        }),
+                        Edit::InsertAfterLine { line } => self.insert_after_line(&line, text)?,
+                        Edit::Replace => self.editor.edit(|editor| editor.replace(text)),
+                    };
                     self.note_changed(changed);
                     Ok(Reply::Value(
                         json!({"revision": self.revision, "changed": changed}),
@@ -764,6 +767,40 @@ impl App {
             }
         })();
         (result, changed)
+    }
+
+    fn insert_after_line(&mut self, line: &str, mut text: String) -> AgentResult<bool> {
+        let note = self.editor.text();
+        let mut matches = note
+            .split_inclusive('\n')
+            .scan(0, |offset, chunk| {
+                *offset += chunk.len();
+                Some((*offset, chunk))
+            })
+            .filter(|(_, chunk)| chunk.lines().next() == Some(line));
+        let (offset, chunk) = matches.next().ok_or_else(|| {
+            Error::new(
+                "anchor_not_found",
+                "No line matches the supplied text exactly.",
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(Error::new(
+                "ambiguous_anchor",
+                "More than one line matches. Choose a unique line.",
+            ));
+        }
+        if text.is_empty() {
+            return Ok(false);
+        }
+        if chunk.ends_with('\n') {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        } else {
+            text.insert(0, '\n');
+        }
+        Ok(self.editor.edit(|editor| editor.insert_at(offset, &text)))
     }
 
     fn perform(&mut self, action: Action) {
@@ -1421,6 +1458,72 @@ mod tests {
         };
         assert_eq!(devices.context, ["Enumeration failed"]);
         assert_eq!(devices.rows[0].name, "System default");
+    }
+
+    #[test]
+    fn agent_inserts_below_a_unique_line_and_undoes_the_edit() {
+        let directory = tempfile::tempdir().unwrap();
+        for (before, after) in [
+            (
+                "  ## Étapes\nExisting",
+                "  ## Étapes\nFirst\nSecond\nExisting",
+            ),
+            ("  ## Étapes", "  ## Étapes\nFirst\nSecond"),
+            ("  ## Étapes\n", "  ## Étapes\nFirst\nSecond\n"),
+        ] {
+            let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+            app.editor = Editor::from_note(before.into(), 0);
+            let insert = || Command::Edit {
+                operation: crate::agent::Edit::InsertAfterLine {
+                    line: "  ## Étapes".into(),
+                },
+                text: "First\nSecond".into(),
+                revision: Some(0),
+            };
+
+            let (result, changed) = app.agent_command(insert());
+            assert!(result.is_ok());
+            assert!(changed);
+            assert_eq!(app.editor.text(), after);
+            assert_eq!(app.revision(), 1);
+
+            let (result, changed) = app.agent_command(insert());
+            assert_eq!(
+                serde_json::to_value(result.err().unwrap()).unwrap()["code"],
+                "stale_revision"
+            );
+            assert!(!changed);
+            assert_eq!(app.editor.text(), after);
+
+            app.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+            assert_eq!(app.editor.text(), before);
+            assert_eq!(app.editor.cursor(), 0);
+        }
+    }
+
+    #[test]
+    fn agent_insertion_rejects_missing_and_duplicate_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        let note = "## Plans\n## Plans\n";
+        app.editor = Editor::from_note(note.into(), 0);
+        for (line, code) in [
+            ("Plans", "anchor_not_found"),
+            ("## Plans", "ambiguous_anchor"),
+        ] {
+            let (result, changed) = app.agent_command(Command::Edit {
+                operation: crate::agent::Edit::InsertAfterLine { line: line.into() },
+                text: "New text".into(),
+                revision: Some(0),
+            });
+            assert_eq!(
+                serde_json::to_value(result.err().unwrap()).unwrap()["code"],
+                code
+            );
+            assert!(!changed);
+            assert_eq!(app.editor.text(), note);
+            assert_eq!(app.revision(), 0);
+        }
     }
 
     #[test]

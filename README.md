@@ -50,7 +50,7 @@ Open DFlow normally and configure your local Windows MCP client to launch the sa
 codex mcp add dflow -- 'C:\Tools\DFlow\dflow.exe' --mcp
 ```
 
-Start a new agent session and ask it to append text to DFlow. The tools can list windows, read the note, append or insert text, replace the note, and explicitly copy it. With multiple windows open, pass the chosen window ID. Replacement uses the revision returned by a read. Each edit is undoable. Edit tools return a busy result while a pane is open or dictation is active or finishing.
+Start a new agent session and ask it to append text to DFlow or insert text below a line such as `## Next steps`. The `insert_after_line` tool takes the exact text of a unique line, the new text, and the revision from `read_note`. The tools can also list windows, insert at the caret, replace the note, and explicitly copy it. With multiple windows open, pass the chosen window ID. Replacing the note also requires its revision. Each edit is undoable. Edit tools return a busy result while a pane is open or dictation is active or finishing.
 
 Agent access is local to your Windows logon session. Start DFlow with `--no-agent-access` to disable it for that window.
 

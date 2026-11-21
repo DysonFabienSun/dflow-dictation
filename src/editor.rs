@@ -359,10 +359,18 @@ impl Editor {
     }
 
     pub fn insert(&mut self, text: &str) -> bool {
+        let range = self.selection().unwrap_or(self.cursor()..self.cursor());
+        self.insert_in_range(range, text)
+    }
+
+    pub fn insert_at(&mut self, offset: usize, text: &str) -> bool {
+        self.insert_in_range(offset..offset, text)
+    }
+
+    fn insert_in_range(&mut self, range: Range<usize>, text: &str) -> bool {
         if text.is_empty() {
             return false;
         }
-        let range = self.selection().unwrap_or(self.cursor()..self.cursor());
         let changed = self.text()[range.clone()] != *text;
         self.clear_selection();
         self.note.cursor = range.start + text.len();
@@ -374,12 +382,7 @@ impl Editor {
     }
 
     pub fn append(&mut self, text: &str) -> bool {
-        if text.is_empty() {
-            return false;
-        }
-        self.clear_selection();
-        self.note.cursor = self.text().len();
-        self.insert(text)
+        self.insert_at(self.text().len(), text)
     }
 
     pub fn replace(&mut self, text: String) -> bool {

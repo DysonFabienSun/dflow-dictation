@@ -15,6 +15,7 @@ pub use pipe::Window;
 pub enum Edit {
     Append,
     Insert,
+    InsertAfterLine { line: String },
     Replace,
 }
 
@@ -98,6 +99,18 @@ struct Replacement {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct LineInsertion {
+    /// Window ID from list_windows. Omit when exactly one window is available.
+    window_id: Option<String>,
+    /// Exact text of one unique line from read_note, including any indentation, without its line ending.
+    line: String,
+    /// Text to put on a new line below the match. May include multiple lines.
+    text: String,
+    /// Required revision from read_note.
+    revision: u64,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct CopyNote {
     /// Window ID from list_windows. Omit when exactly one window is available.
     window_id: Option<String>,
@@ -144,6 +157,25 @@ impl Tools {
     )]
     async fn insert_text(&self, Parameters(args): Parameters<TextEdit>) -> CallToolResult {
         edit(args, Edit::Insert).await
+    }
+
+    #[tool(
+        description = "Insert text on new lines below an exact, unique line in a DFlow note. Read the note first and pass its revision.",
+        annotations(destructive_hint = false, idempotent_hint = false)
+    )]
+    async fn insert_after_line(
+        &self,
+        Parameters(args): Parameters<LineInsertion>,
+    ) -> CallToolResult {
+        edit(
+            TextEdit {
+                window_id: args.window_id,
+                text: args.text,
+                revision: Some(args.revision),
+            },
+            Edit::InsertAfterLine { line: args.line },
+        )
+        .await
     }
 
     #[tool(
