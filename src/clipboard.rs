@@ -46,7 +46,7 @@ impl Clipboard {
         })
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn test_sink() -> (
         Self,
         Receiver<ClipboardWrite>,

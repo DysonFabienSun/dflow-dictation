@@ -1,3 +1,4 @@
+use crate::hotkey::Hotkey;
 use std::{
     env,
     fs::{self, File},
@@ -16,6 +17,17 @@ pub struct Settings {
 
 pub const DEFAULT_PROXY: &str = "http://127.0.0.1:10808";
 const DEFAULT_HOLD_DELAY_MS: u32 = 1000;
+
+pub fn settings_path() -> std::io::Result<PathBuf> {
+    settings_path_for(&env::current_exe()?)
+}
+
+fn settings_path_for(executable: &Path) -> std::io::Result<PathBuf> {
+    executable
+        .parent()
+        .map(|root| root.join("config").join("dflow.toml"))
+        .ok_or_else(|| std::io::Error::other("Cannot locate the DFlow executable directory."))
+}
 
 impl Default for Settings {
     fn default() -> Self {
@@ -130,6 +142,24 @@ impl Config {
     }
 
     pub fn save(&mut self, settings: Settings) -> Result<(), String> {
+        self.save_with_hotkey(settings, None)
+    }
+
+    pub fn tray_hotkey(&self) -> Result<Hotkey, String> {
+        string(table(&self.document, "tray")?, "hotkey")?
+            .map(|text| text.parse().map_err(str::to_owned))
+            .unwrap_or_else(|| Ok(Hotkey::default()))
+    }
+
+    pub fn save_tray(&mut self, settings: Settings, hotkey: Hotkey) -> Result<(), String> {
+        self.save_with_hotkey(settings, Some(hotkey))
+    }
+
+    fn save_with_hotkey(
+        &mut self,
+        settings: Settings,
+        hotkey: Option<Hotkey>,
+    ) -> Result<(), String> {
         if self.error.is_some() {
             return Err(format!(
                 "Correct {} and restart DFlow before saving.",
@@ -137,6 +167,10 @@ impl Config {
             ));
         }
         let mut document = self.document.clone();
+        if let Some(hotkey) = hotkey {
+            table(&document, "tray")?;
+            set_optional(&mut document, "tray", "hotkey", Some(&hotkey.to_string()));
+        }
         set_optional(
             &mut document,
             "audio",
@@ -270,6 +304,32 @@ fn set_optional(doc: &mut DocumentMut, table: &str, key: &str, text: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applications_share_config_only_in_the_same_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let scratchpad = settings_path_for(&root.path().join("dflow.exe")).unwrap();
+        let tray = settings_path_for(&root.path().join("dflow-tray.exe")).unwrap();
+        let separate =
+            settings_path_for(&root.path().join("separate").join("dflow-tray.exe")).unwrap();
+        assert_eq!(scratchpad, tray);
+        assert_ne!(scratchpad, separate);
+        let alternate = "Ctrl+Shift+F2".parse().unwrap();
+        let mut tray = Config::load(tray);
+        assert_eq!(tray.tray_hotkey().unwrap(), Hotkey::default());
+        tray.save_tray(tray.settings.clone(), alternate).unwrap();
+        let mut scratchpad = Config::load(scratchpad);
+        let mut settings = scratchpad.settings.clone();
+        settings.hold_delay_ms = 300;
+        scratchpad.save(settings).unwrap();
+        let shared = Config::load(scratchpad.path);
+        assert_eq!(shared.settings.hold_delay_ms, 300);
+        assert_eq!(shared.tray_hotkey().unwrap(), alternate);
+        assert_eq!(
+            Config::load(separate).tray_hotkey().unwrap(),
+            Hotkey::default()
+        );
+    }
 
     #[test]
     fn saves_settings_without_losing_unrelated_keys() {

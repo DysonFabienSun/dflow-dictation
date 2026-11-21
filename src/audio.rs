@@ -94,7 +94,7 @@ impl Session {
                 .compare_exchange(RECORDING, STOPPING, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn test_channel() -> (Self, Sender<Update>) {
         let (send, updates) = mpsc::channel();
         let state = Arc::new(AtomicU8::new(RECORDING));
@@ -475,7 +475,7 @@ fn wav(samples: impl IntoIterator<Item = i16>) -> Result<Vec<u8>, hound::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::editor::Editor;
+    use crate::editor::{Editor, Movement};
 
     #[test]
     fn warns_for_missing_or_low_input_and_clears_on_recovery() {
@@ -648,9 +648,9 @@ mod tests {
             thread::spawn(move || upload(Fake, pending, &updates, &AtomicU8::new(RECORDING)));
         let mut editor = Editor::default();
         editor.insert("Before after");
-        editor.home();
+        editor.move_caret(Movement::Home, false, 80);
         for _ in 0..7 {
-            editor.right();
+            editor.move_caret(Movement::Right, false, 80);
         }
         let mut range = editor.cursor()..editor.cursor();
         editor.begin();

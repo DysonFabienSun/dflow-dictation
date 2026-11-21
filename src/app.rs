@@ -4,7 +4,7 @@ use crate::{
     clipboard::{Clipboard, ClipboardFeedback},
     codex::login_status,
     config::{Config, ProxySettings, parse_proxy_url},
-    editor::Editor,
+    editor::{BurstKind, Editor, Movement},
     transcript::clean_text,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -23,6 +23,8 @@ type DeviceList = Result<Vec<InputDevice>, String>;
 enum Action {
     Clear,
     Lowercase,
+    Undo,
+    Redo,
     Settings,
     Devices,
     Provider,
@@ -58,9 +60,24 @@ impl Row {
 pub struct Menu {
     pub title: &'static str,
     pub context: Vec<String>,
-    pub query: Option<String>,
+    pub query: Option<CommandQuery>,
     pub rows: Vec<Row>,
     pub selected: usize,
+}
+
+pub struct CommandQuery {
+    text: String,
+    slash_prompt: bool,
+}
+
+impl CommandQuery {
+    pub fn display(&self) -> String {
+        if self.slash_prompt && !self.text.starts_with(['/', ':']) {
+            format!("/{}", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
 }
 
 impl Menu {
@@ -68,9 +85,10 @@ impl Menu {
         self.rows
             .iter()
             .filter(|row| {
-                self.query
-                    .as_ref()
-                    .is_none_or(|query| row.name.starts_with(&format!("/{query}")))
+                self.query.as_ref().is_none_or(|query| {
+                    let text = query.text.strip_prefix('/').unwrap_or(&query.text);
+                    row.name.trim_start_matches('/').starts_with(text)
+                })
             })
             .collect()
     }
@@ -90,17 +108,20 @@ impl Menu {
             }
             KeyCode::Tab if self.query.is_some() => {
                 if let Some(row) = self.visible().get(self.selected) {
-                    self.query = Some(row.name.trim_start_matches('/').to_owned());
+                    let text = row.name.trim_start_matches('/').to_owned();
+                    self.query.as_mut().unwrap().text = text;
                     self.selected = 0;
                 }
             }
             KeyCode::Backspace if self.query.is_some() => {
-                self.query.as_mut().unwrap().pop();
+                self.query.as_mut().unwrap().text.pop();
                 self.selected = 0;
             }
-            KeyCode::Char(c) if self.query.is_some() && (c.is_ascii_alphanumeric() || c == '-') => {
-                self.query.as_mut().unwrap().push(c.to_ascii_lowercase());
-                self.selected = 0;
+            KeyCode::Char(c) if !c.is_control() => {
+                if let Some(query) = &mut self.query {
+                    query.text.push(c.to_ascii_lowercase());
+                    self.selected = 0;
+                }
             }
             _ => {}
         }
@@ -201,7 +222,7 @@ pub struct App {
     pub quit: bool,
     config: Config,
     clipboard: Clipboard,
-    pending_cut: Option<(u64, oneshot::Receiver<ClipboardFeedback>)>,
+    pending_cut: Option<PendingCut>,
     device_scan: Option<Receiver<DeviceList>>,
     dictation: Option<Dictation>,
     space_down: bool,
@@ -209,6 +230,13 @@ pub struct App {
     copied: Option<(usize, Instant)>,
     revision: u64,
     agent_error: Option<String>,
+    pub cache_error: Option<&'static str>,
+}
+
+struct PendingCut {
+    revision: u64,
+    range: Range<usize>,
+    reply: oneshot::Receiver<ClipboardFeedback>,
 }
 
 impl App {
@@ -229,7 +257,12 @@ impl App {
             copied: None,
             revision: 0,
             agent_error: None,
+            cache_error: None,
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn status(&self) -> (&str, bool) {
@@ -270,10 +303,13 @@ impl App {
         if !self.panes.is_empty() {
             return ("↑↓ select · Enter confirm · Esc back", false);
         }
+        if let Some(error) = self.cache_error {
+            return (error, true);
+        }
         if let Some(error) = &self.agent_error {
             return (error, true);
         }
-        ("Ctrl+Space dictate · Ctrl+/ commands · Ctrl+Z undo", false)
+        ("Ctrl+Space dictate · Esc commands · Ctrl+Z undo", false)
     }
 
     pub fn copied_characters(&self) -> Option<usize> {
@@ -283,14 +319,15 @@ impl App {
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
         let mut redraw = self.poll_devices();
-        if let Some((revision, reply)) = &mut self.pending_cut {
-            match reply.try_recv() {
+        if let Some(cut) = &mut self.pending_cut {
+            match cut.reply.try_recv() {
                 Ok(feedback) => {
                     if matches!(feedback, ClipboardFeedback::Copied(_))
-                        && *revision == self.revision
+                        && cut.revision == self.revision
                         && self.dictation.is_none()
                     {
-                        let changed = self.editor.clear();
+                        let range = cut.range.clone();
+                        let changed = self.editor.edit(|editor| editor.erase(range));
                         self.note_changed(changed);
                         redraw |= changed;
                     }
@@ -375,6 +412,7 @@ impl App {
                 }
             }
             Event::FocusLost => {
+                self.editor.end_burst();
                 self.space_down = false;
                 if self.dictation.as_ref().is_some_and(|d| {
                     d.gesture != SpaceGesture::Toggle && d.phase != DictationPhase::Finishing
@@ -402,6 +440,9 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if key.code == KeyCode::Esc && key.kind == KeyEventKind::Repeat {
+            return;
+        }
         let control = key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT);
         if control {
@@ -415,13 +456,9 @@ impl App {
                 KeyCode::Char('x') => {
                     if self.pending_cut.is_none() && !self.editor.text().is_empty() {
                         self.end();
+                        self.editor.end_burst();
                         self.copy_shortcut(true);
                     }
-                    return;
-                }
-                KeyCode::Char('w') => {
-                    self.end();
-                    self.quit = true;
                     return;
                 }
                 _ => {}
@@ -446,13 +483,37 @@ impl App {
             }
             return;
         }
-        if control {
-            self.control_key(key);
-            return;
-        }
         if key.modifiers.contains(KeyModifiers::ALT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
+            return;
+        }
+        if self.panes.is_empty() {
+            let movement = match (key.code, control) {
+                (KeyCode::Left, false) => Some(Movement::Left),
+                (KeyCode::Right, false) => Some(Movement::Right),
+                (KeyCode::Up, false) => Some(Movement::Up),
+                (KeyCode::Down, false) => Some(Movement::Down),
+                (KeyCode::Home, false) => Some(Movement::Home),
+                (KeyCode::End, false) => Some(Movement::End),
+                (KeyCode::Left, true) => Some(Movement::WordLeft),
+                (KeyCode::Right, true) => Some(Movement::WordRight),
+                (KeyCode::Home, true) => Some(Movement::NoteStart),
+                (KeyCode::End, true) => Some(Movement::NoteEnd),
+                _ => None,
+            };
+            if let Some(movement) = movement {
+                self.notice = None;
+                self.editor.move_caret(
+                    movement,
+                    key.modifiers.contains(KeyModifiers::SHIFT),
+                    self.note_width,
+                );
+                return;
+            }
+        }
+        if control {
+            self.control_key(key);
             return;
         }
         self.notice = None;
@@ -463,31 +524,31 @@ impl App {
             return;
         }
 
-        match key.code {
-            KeyCode::Left => self.editor.left(),
-            KeyCode::Right => self.editor.right(),
-            KeyCode::Up => self.editor.vertical(false, self.note_width),
-            KeyCode::Down => self.editor.vertical(true, self.note_width),
-            KeyCode::Home => self.editor.home(),
-            KeyCode::End => self.editor.end(),
-            KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter | KeyCode::Tab => {
-                let changed = self.editor.edit(|editor| match key.code {
-                    KeyCode::Backspace => editor.backspace(),
-                    KeyCode::Delete => editor.delete(),
-                    KeyCode::Enter => editor.insert("\n"),
-                    KeyCode::Tab => editor.insert("    "),
-                    _ => unreachable!(),
-                });
-                self.note_changed(changed);
+        let changed = match key.code {
+            KeyCode::Esc => {
+                self.editor.end_burst();
+                self.panes.push(Pane::Menu(commands(false)));
+                return;
             }
+            KeyCode::Backspace => {
+                self.editor
+                    .edit_burst(BurstKind::Backspace, Instant::now(), Editor::backspace)
+            }
+            KeyCode::Delete => {
+                self.editor
+                    .edit_burst(BurstKind::Delete, Instant::now(), Editor::delete)
+            }
+            KeyCode::Enter => self.editor.edit(|editor| editor.insert("\n")),
+            KeyCode::Tab => self.editor.edit(|editor| editor.insert("    ")),
             KeyCode::Char(c) if !c.is_control() => {
-                let changed = self
-                    .editor
-                    .edit(|editor| editor.insert(c.encode_utf8(&mut [0; 4])));
-                self.note_changed(changed);
+                self.editor
+                    .edit_burst(BurstKind::Typing, Instant::now(), |editor| {
+                        editor.insert(c.encode_utf8(&mut [0; 4]))
+                    })
             }
-            _ => {}
-        }
+            _ => return,
+        };
+        self.note_changed(changed);
     }
 
     fn control_key(&mut self, key: KeyEvent) {
@@ -500,18 +561,20 @@ impl App {
             }
             KeyCode::Char('/') => {
                 if self.panes.is_empty() {
-                    self.panes.push(Pane::Menu(commands()));
+                    self.editor.end_burst();
+                    self.panes.push(Pane::Menu(commands(true)));
                     self.notice = None;
                 } else if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.query.is_some())
                 {
                     self.panes.pop();
                 }
             }
-            KeyCode::Char('z') if self.panes.is_empty() => {
+            KeyCode::Char('a') if self.panes.is_empty() => {
                 self.notice = None;
-                let changed = self.editor.undo();
-                self.note_changed(changed);
+                self.editor.select_all();
             }
+            KeyCode::Char('z') if self.panes.is_empty() => self.perform(Action::Undo),
+            KeyCode::Char('y') if self.panes.is_empty() => self.perform(Action::Redo),
             KeyCode::Char(' ')
                 if self.panes.is_empty()
                     && !self.space_down
@@ -533,6 +596,7 @@ impl App {
     fn start(&mut self) {
         let pressed = Instant::now();
         let cursor = self.editor.cursor();
+        self.editor.clear_selection();
         self.editor.begin();
         self.dictation = Some(Dictation {
             session: Session::start(self.config.settings.clone()),
@@ -562,15 +626,26 @@ impl App {
     }
 
     fn copy_shortcut(&mut self, cut: bool) {
+        let range = self
+            .editor
+            .selection()
+            .unwrap_or(0..self.editor.text().len());
         let (reply, confirmation) = if cut {
             let (reply, confirmation) = oneshot::channel();
             (Some(reply), Some(confirmation))
         } else {
             (None, None)
         };
-        if self.clipboard.copy(self.editor.text(), reply) {
-            if let Some(confirmation) = confirmation {
-                self.pending_cut = Some((self.revision, confirmation));
+        if self
+            .clipboard
+            .copy(&self.editor.text()[range.clone()], reply)
+        {
+            if let Some(reply) = confirmation {
+                self.pending_cut = Some(PendingCut {
+                    revision: self.revision,
+                    range,
+                    reply,
+                });
             }
         } else {
             self.notice = Some("The Windows clipboard is busy.".into());
@@ -621,7 +696,12 @@ impl App {
                     let text = clean_text(&text);
                     changed = self.editor.edit(|editor| match operation {
                         Edit::Append => editor.append(&text),
-                        Edit::Insert => editor.insert(&text),
+                        Edit::Insert => {
+                            if !text.is_empty() {
+                                editor.clear_selection();
+                            }
+                            editor.insert(&text)
+                        }
                         Edit::Replace => editor.replace(text),
                     });
                     self.note_changed(changed);
@@ -656,6 +736,16 @@ impl App {
         match action {
             Action::Back => unreachable!(),
             Action::Quit => self.quit = true,
+            Action::Undo => {
+                self.notice = None;
+                let changed = self.editor.undo();
+                self.note_changed(changed);
+            }
+            Action::Redo => {
+                self.notice = None;
+                let changed = self.editor.redo();
+                self.note_changed(changed);
+            }
             Action::Clear => {
                 let changed = self.editor.clear();
                 self.note_changed(changed);
@@ -963,11 +1053,14 @@ impl App {
     }
 }
 
-fn commands() -> Menu {
+fn commands(slash_prompt: bool) -> Menu {
     Menu {
         title: "Commands",
         context: Vec::new(),
-        query: Some(String::new()),
+        query: Some(CommandQuery {
+            text: String::new(),
+            slash_prompt,
+        }),
         selected: 0,
         rows: vec![
             Row::new("/clear", "Clear the note", Action::Clear),
@@ -996,6 +1089,9 @@ fn commands() -> Menu {
             ),
             Row::new("/help", "Show keyboard shortcuts", Action::Help),
             Row::new("/quit", "Return to PowerShell", Action::Quit),
+            Row::new(":q", "Return to PowerShell", Action::Quit),
+            Row::new(":h", "Show keyboard shortcuts", Action::Help),
+            Row::new(":u", "Undo the last edit", Action::Undo),
         ],
     }
 }
@@ -1005,7 +1101,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clipboard_shortcuts_copy_cut_undo_and_quit() {
+    fn clipboard_shortcuts_copy_cut_and_undo() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
         let (clipboard, notes, report) = Clipboard::test_sink();
@@ -1084,9 +1180,129 @@ mod tests {
         assert_eq!(app.editor.text(), "Entire note!");
         app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(notes.try_recv().is_err());
+    }
 
-        app.key(ctrl('w'));
+    #[test]
+    fn keyboard_selection_replaces_text_and_cuts_the_original_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        let (clipboard, notes, _report) = Clipboard::test_sink();
+        app.clipboard = clipboard;
+        let ctrl = |letter| KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL);
+        let shifted = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        app.editor.insert("one two 👩‍💻");
+
+        app.key(shifted(KeyCode::Left));
+        let select_word_left =
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        app.key(select_word_left);
+        assert_eq!(app.editor.selection(), Some(4..19));
+        app.key(ctrl('c'));
+        assert_eq!(notes.try_recv().unwrap().text, "two 👩‍💻");
+
+        app.key(ctrl('x'));
+        let cut = notes.try_recv().unwrap();
+        assert_eq!(cut.text, "two 👩‍💻");
+        app.key(ctrl('a'));
+        assert_eq!(app.editor.selection(), Some(0..19));
+        cut.reply
+            .unwrap()
+            .send(ClipboardFeedback::Copied(5))
+            .ok()
+            .unwrap();
+        assert!(app.tick());
+        assert_eq!(app.editor.text(), "one ");
+        assert!(app.editor.selection().is_none());
+
+        app.key(ctrl('a'));
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.editor.text(), "x");
+        app.key(ctrl('z'));
+        assert_eq!(app.editor.text(), "one ");
+        app.key(ctrl('a'));
+        app.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(app.editor.text().is_empty());
+    }
+
+    #[test]
+    fn command_menu_entry_points_dismiss_and_run_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let esc = key(KeyCode::Esc);
+        let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL);
+        let enter = key(KeyCode::Enter);
+
+        app.key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert!(!app.quit);
+
+        for (entry, prefix) in [(esc, ""), (slash, "/")] {
+            app.key(entry);
+            let Some(Pane::Menu(menu)) = app.panes.last() else {
+                panic!("expected command menu");
+            };
+            assert_eq!(menu.query.as_ref().unwrap().display(), prefix);
+            app.key(key(KeyCode::Char('c')));
+            app.key(esc);
+            assert!(app.panes.is_empty());
+        }
+
+        let run = |app: &mut App, entry, command: &str| {
+            app.key(entry);
+            for c in command.chars() {
+                app.key(key(KeyCode::Char(c)));
+            }
+            app.key(enter);
+        };
+        app.key(key(KeyCode::Char('A')));
+        run(&mut app, esc, "lowercase");
+        assert_eq!(app.editor.text(), "a");
+        run(&mut app, slash, ":u");
+        assert_eq!(app.editor.text(), "A");
+        run(&mut app, esc, ":h");
+        assert!(matches!(app.panes.as_slice(), [Pane::Help]));
+        app.key(esc);
+        for entry in [esc, slash] {
+            run(&mut app, entry, "/help");
+            assert!(matches!(app.panes.as_slice(), [Pane::Help]));
+            app.key(esc);
+        }
+        run(&mut app, esc, ":q!");
+        assert!(!app.quit);
+        app.key(esc);
+        run(&mut app, esc, ":q");
         assert!(app.quit);
+        for entry in [esc, slash] {
+            app.quit = false;
+            run(&mut app, entry, "/quit");
+            assert!(app.quit);
+        }
+    }
+
+    #[test]
+    fn keyboard_history_keeps_replacements_newlines_and_pastes_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let ctrl = |letter| KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL);
+        app.editor.insert("draft");
+        app.key(ctrl('a'));
+        for c in "new".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        app.event(Event::Paste("pasted".into()));
+        app.key(key(KeyCode::Char('!')));
+        assert_eq!(app.editor.text(), "new\npasted!");
+
+        for previous in ["new\npasted", "new\n", "new", "draft"] {
+            app.key(ctrl('z'));
+            assert_eq!(app.editor.text(), previous);
+        }
+        for next in ["new", "new\n", "new\npasted", "new\npasted!"] {
+            app.key(ctrl('y'));
+            assert_eq!(app.editor.text(), next);
+        }
     }
 
     #[test]

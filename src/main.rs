@@ -1,12 +1,9 @@
 mod agent;
 mod app;
-mod audio;
-mod clipboard;
-mod codex;
-mod config;
-mod editor;
-mod transcript;
+mod cache;
 mod ui;
+
+use dflow_scratchpad::{audio, clipboard, codex, config, editor, transcript};
 
 use crossterm::{
     cursor::Show,
@@ -18,7 +15,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     env,
     io::{self, IsTerminal},
-    path::PathBuf,
+    path::Path,
     time::Duration,
 };
 
@@ -76,8 +73,39 @@ impl Drop for Screen {
     }
 }
 
-fn run(path: PathBuf, agent_access: bool) -> io::Result<()> {
+fn run(path: std::path::PathBuf, agent_access: bool) -> io::Result<()> {
+    let cache_path = path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| io::Error::other("Cannot locate the DFlow executable directory."))?
+        .join("cache")
+        .join("note.json");
     let mut app = app::App::new(config::Config::load(path));
+    match cache::CachedNote::load(&cache_path) {
+        Ok(note) => app.editor = note.into_editor(),
+        Err(_) => app.cache_error = Some("Could not restore note · check cache/note.json"),
+    }
+    let mut cache = match cache::NoteCache::start(cache_path, app.editor.cursor()) {
+        Ok(cache) => Some(cache),
+        Err(_) => {
+            app.cache_error = Some("Could not start saving the note cache");
+            None
+        }
+    };
+    let result = run_terminal(&mut app, cache.as_mut(), agent_access);
+    if let Some(cache) = cache
+        && cache.finish(app.revision(), &app.editor).is_err()
+    {
+        eprintln!("DFlow: Could not save the note cache. Check cache/note.json.");
+    }
+    result
+}
+
+fn run_terminal(
+    app: &mut app::App,
+    mut cache: Option<&mut cache::NoteCache>,
+    agent_access: bool,
+) -> io::Result<()> {
     let _screen = Screen::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let window = if agent_access {
@@ -103,8 +131,15 @@ fn run(path: PathBuf, agent_access: bool) -> io::Result<()> {
                 }
             }
         }
+        if let Some(cache) = cache.as_deref_mut()
+            && let Some(saved) = cache.update(app.revision(), &app.editor)
+        {
+            let error = (!saved).then_some("Could not save note · check cache/note.json");
+            redraw |= app.cache_error != error;
+            app.cache_error = error;
+        }
         if redraw {
-            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            terminal.draw(|frame| ui::draw(frame, app))?;
             redraw = false;
         }
         if event::poll(Duration::from_millis(20))? {
@@ -123,7 +158,7 @@ fn main() -> std::process::ExitCode {
         match first.to_str() {
             Some("--help" | "-h") if arguments.next().is_none() => {
                 println!(
-                    "DFlow · Dictation scratchpad\n\nUsage: dflow [--no-agent-access]\n       dflow --mcp\n\nOpen DFlow in PowerShell 7 under Windows Terminal.\nCtrl+Space dictates, Ctrl+/ opens commands, and Ctrl+Z undoes.\nCtrl+C copies the note, Ctrl+X cuts it, and Ctrl+W exits."
+                    "DFlow · Dictation scratchpad\n\nUsage: dflow [--no-agent-access]\n       dflow --mcp\n\nOpen DFlow in PowerShell 7 under Windows Terminal.\nCtrl+Space dictates and Esc opens commands.\nCtrl+Z undoes, Ctrl+Y redoes, Ctrl+C copies, and Ctrl+X cuts.\nUse :q or /quit from the command menu to exit."
                 );
                 return ExitCode::SUCCESS;
             }
@@ -155,12 +190,7 @@ fn main() -> std::process::ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let result = env::current_exe().and_then(|path| {
-        let root = path
-            .parent()
-            .ok_or_else(|| io::Error::other("Cannot locate the DFlow executable directory."))?;
-        run(root.join("config").join("dflow.toml"), agent_access)
-    });
+    let result = config::settings_path().and_then(|path| run(path, agent_access));
     if let Err(error) = result {
         eprintln!("DFlow: {error}");
         return ExitCode::FAILURE;

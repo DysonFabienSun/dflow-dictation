@@ -35,10 +35,22 @@ jobs:
             throw "Tag $env:RELEASE_TAG does not match Cargo version v$version."
           }
 
-          cargo build --locked --release --bin dflow
+          cargo build --locked --release --bins
           if ($LASTEXITCODE -ne 0) { throw 'Cargo release build failed.' }
 
-      - name: Attach dflow.exe to a draft release
+      - name: Package both Windows apps
+        shell: pwsh
+        run: |
+          $executables = './target/release/dflow.exe', './target/release/dflow-tray.exe'
+          foreach ($exe in $executables) {
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+              throw "Missing Windows release executable $exe."
+            }
+          }
+          $archive = Join-Path $env:RUNNER_TEMP "DFlow-$env:RELEASE_TAG-windows.zip"
+          Compress-Archive -LiteralPath $executables -DestinationPath $archive -Force -ErrorAction Stop
+
+      - name: Create a draft release with both apps and setup instructions
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -59,10 +71,13 @@ jobs:
           [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
           $lines = git for-each-ref '--format=%(contents)' $tagRef
           if ($LASTEXITCODE -ne 0) { throw 'Could not read the tag annotation.' }
-          $notes = ($lines -join "`n").TrimEnd("`r", "`n") + "`n"
-          if ([string]::IsNullOrWhiteSpace($notes)) { throw 'The changelog is empty.' }
+          $changelog = ($lines -join "`n").TrimEnd("`r", "`n")
+          if ([string]::IsNullOrWhiteSpace($changelog)) { throw 'The changelog is empty.' }
+          $quickStart = Get-Content -LiteralPath '.github/release-quickstart.md' -Raw -ErrorAction Stop
+          $notes = $changelog + "`n`n" + $quickStart.TrimEnd() + "`n"
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-          Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM -NoNewline
+          Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM -NoNewline -ErrorAction Stop
 
-          gh release create "$env:RELEASE_TAG" ./target/release/dflow.exe --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
+          $archive = Join-Path $env:RUNNER_TEMP "DFlow-$env:RELEASE_TAG-windows.zip"
+          gh release create "$env:RELEASE_TAG" "$archive" ./target/release/dflow.exe ./target/release/dflow-tray.exe --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }

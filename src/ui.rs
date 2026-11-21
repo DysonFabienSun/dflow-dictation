@@ -15,6 +15,7 @@ use unicode_width::UnicodeWidthStr;
 const SECONDARY: Style = Style::new().fg(Color::DarkGray);
 const ACCENT: Style = Style::new().fg(Color::Cyan);
 const SELECTED: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+const NOTE_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
@@ -46,10 +47,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         Some(Pane::Help) => vec![
             Line::styled("Keyboard shortcuts", ACCENT),
-            Line::raw("Type to edit · arrows move · Ctrl+Z undo"),
+            Line::raw("Shift+arrows select · Ctrl+A select all"),
+            Line::raw("Ctrl+Shift+←/→ select by word"),
+            Line::raw("Ctrl+Z undo · Ctrl+Y redo"),
             Line::raw("Ctrl+Space dictate · hold for push-to-talk"),
-            Line::raw("Ctrl+C copy · Ctrl+X cut · Ctrl+W quit"),
-            Line::raw("Ctrl+/ commands"),
+            Line::raw("Ctrl+C copy · Ctrl+X cut"),
+            Line::raw("Esc or Ctrl+/ commands · :h help · :u undo · :q quit"),
             Line::styled("Esc close", SECONDARY),
         ],
         None => Vec::new(),
@@ -81,7 +84,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } else if let Some(Pane::Menu(menu)) = app.panes.last()
             && let Some(query) = &menu.query
         {
-            let column = (query.len() + 1).min(usize::from(content.width - 1));
+            let column = query.display().width().min(usize::from(content.width - 1));
             frame.set_cursor_position(Position::new(content.x + column as u16, note_area.bottom()));
         }
     }
@@ -128,13 +131,23 @@ fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
             area,
         );
     } else {
-        let lines: Vec<_> = rows
-            .into_iter()
-            .skip(app.top_row)
-            .take(height)
-            .map(|row| Line::raw(row.text))
+        let visible = &rows[app.top_row..(app.top_row + height).min(rows.len())];
+        let lines: Vec<_> = visible
+            .iter()
+            .map(|row| Line::raw(row.text.as_str()))
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
+        if let Some(selection) = app.editor.selection() {
+            for (index, row) in visible.iter().enumerate() {
+                let columns = row.selected_columns(&selection);
+                let start = columns.start.min(usize::from(area.width)) as u16;
+                let end = columns.end.min(usize::from(area.width)) as u16;
+                frame.buffer_mut().set_style(
+                    Rect::new(area.x + start, area.y + index as u16, end - start, 1),
+                    NOTE_SELECTION,
+                );
+            }
+        }
     }
     if app.panes.is_empty() {
         frame.set_cursor_position(Position::new(
@@ -150,7 +163,7 @@ fn menu_lines(menu: &Menu, width: u16, height: u16) -> Vec<Line<'static>> {
     }
     let visible = menu.visible();
     let mut lines = vec![if let Some(query) = &menu.query {
-        Line::styled(format!("/{query}"), SELECTED)
+        Line::styled(query.display(), SELECTED)
     } else {
         Line::styled(menu.title, SELECTED)
     }];
