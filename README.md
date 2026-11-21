@@ -2,30 +2,25 @@
 
 <img src="assets/dflow.svg" alt="DFlow icon" width="72">
 
-DFlow is a keyboard-first scratchpad for typing or dictating text and copying it to the Windows clipboard. It restores the last saved note and caret when you reopen it.
+DFlow is keyboard-first dictation for Windows. Use a global hotkey to dictate from the tray, or capture, edit, and save text in the scratchpad. Both apps use your existing Codex CLI login for dictation.
 
-## Get started
+## Install on Windows
 
-Download the Windows ZIP from [Releases](https://github.com/DysonFabienSun/dflow-scratchpad/releases) and extract it into a writable folder. It contains the DFlow scratchpad (`dflow.exe`) and DFlow Tray (`dflow-tray.exe`). You can also download either executable individually.
+Download the Windows ZIP and extract it into a writable folder. The ZIP contains DFlow Tray (`dflow-tray.exe`) and DFlow Scratchpad (`dflow.exe`). Each executable is also available individually. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
 
-Run `.\dflow.exe` in PowerShell 7 under Windows Terminal for the scratchpad, or launch `dflow-tray.exe` for dictation into other apps. Both use your existing Codex CLI login for dictation. When upgrading, close both apps before replacing the executables and keep the `config` and `cache` folders.
+When upgrading, close both apps before replacing the executables. Keep the `config` and `cache` folders to preserve your settings and saved note.
 
-To build from source on Windows, run these commands from the repository root with Rust and Cargo installed.
+## Dictate from the tray
 
-```powershell
-cargo build --release --locked --bins
-.\target\release\dflow.exe
-```
+1. Launch `dflow-tray.exe`. DFlow Tray runs in the Windows notification area.
+2. Place the caret where you want the text. Press **Ctrl+Shift+/** to start dictation, then press it again to finish. The default shortcut uses the slash/question-mark key on a US keyboard.
+3. DFlow can insert single-line text into the original supported Windows edit control. For other apps, multiline results, or a focus change, choose **Copy last transcript** from the tray menu and paste it where you want it.
 
-## Dictate into other apps
+Open **Settings** from the tray icon to change the shortcut or enable **Start with Windows**. The tray keeps the latest transcript in memory for the current session. To bring it into the scratchpad, copy it from the tray menu and paste it into the note.
 
-Run `dflow-tray.exe` to start DFlow Tray without a terminal window. Put the caret in the app where you want to type, press **Ctrl+Shift+/** to start dictation, and press it again to finish. DFlow Tray can insert single-line text directly into the original supported Windows edit control if focus stays there. Use **Copy last transcript** from the tray menu for other apps, after a focus change, or for transcripts with line breaks. DFlow Tray keeps the latest result in memory for the current session.
+## Capture and edit in the scratchpad
 
-Open **Settings** from the tray icon to change the shortcut, microphone, Codex auth file, or proxy, or to enable **Start with Windows**. The default shortcut uses the slash/question-mark key on a US keyboard. Each executable reads `config/dflow.toml` beside itself. Put both executables in one folder to share settings, or use separate folders for independent settings. DFlow Tray reads shared audio and provider settings before each recording. Restart the scratchpad after changes made by the tray.
-
-The scratchpad note and tray transcript are separate. To move a tray transcript into the scratchpad, choose **Copy last transcript** and paste it into the note.
-
-## Edit, dictate, and copy
+Run `.\dflow.exe` in PowerShell 7 under Windows Terminal. Type directly in the note, or use **Ctrl+Space** to dictate at the caret. DFlow saves the note and caret as you work and restores both when you reopen it.
 
 | Shortcut | Action |
 | --- | --- |
@@ -49,13 +44,15 @@ DFlow saves the note in `cache/note.json` beside the `config` folder as you edit
 
 ## Settings
 
-DFlow creates `config/dflow.toml` beside the executable when you save a setting. If the file changes while DFlow is open, restart DFlow before saving settings. Copy the executable by itself into another writable folder to start with separate settings.
+Keep both executables in one folder to share microphone, Codex auth, and proxy settings. DFlow creates `config/dflow.toml` beside the executable when you save a setting. Use separate folders for independent settings.
+
+Change shared settings in the tray's **Settings** dialog or the scratchpad's `/settings` menu. The tray reads the shared dictation settings before each recording. Restart the scratchpad after changing shared settings in the tray or editing the file directly.
 
 - **`/device`** chooses a microphone. DFlow uses the current Windows default unless you select a specific device.
 - **`/provider`** shows whether DFlow can find your Codex login. Set an auth-file path there if needed. Automatic discovery uses `$CODEX_HOME/auth.json` when `CODEX_HOME` is set, or `%USERPROFILE%\.codex\auth.json` otherwise.
 - **`/proxy`** configures an optional proxy for dictation. It starts disabled with a saved address of `http://127.0.0.1:10808`. Use `/proxyon` or `/proxyoff` to switch for the next dictation. Supported URLs use `http://`, `https://`, or `socks5://` with a host and optional port.
 
-Open all three from `/settings`. The push-to-talk threshold defaults to one second. To shorten it, set `hold_delay_ms = 250` under `[audio]` in the config file and restart DFlow.
+The scratchpad's push-to-talk threshold defaults to one second. To shorten it, set `hold_delay_ms = 250` under `[audio]` in the config file and restart the scratchpad.
 
 ## Connect a local agent
 
@@ -68,3 +65,13 @@ codex mcp add dflow -- 'C:\Tools\DFlow\dflow.exe' --mcp
 Start a new agent session and ask it to append text to DFlow. The tools can list windows, read the note, append or insert text, replace the note, and explicitly copy it. With multiple windows open, pass the chosen window ID. Replacement uses the revision returned by a read. Each edit is undoable. Edit tools return a busy result while a pane is open or dictation is active or finishing.
 
 Agent access is local to your Windows logon session. Start DFlow with `--no-agent-access` to disable it for that window.
+
+## Build from source
+
+With Rust and Cargo installed on Windows, run this from the repository root.
+
+```powershell
+cargo build --release --locked --bins
+```
+
+Launch `target\release\dflow-tray.exe` for the tray or run `.\target\release\dflow.exe` in Windows Terminal for the scratchpad.
