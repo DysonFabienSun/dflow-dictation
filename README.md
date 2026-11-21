@@ -8,23 +8,23 @@ Use a global hotkey to dictate from the tray, or capture, edit, and save text in
 
 ## Install on Windows
 
-Download the Windows ZIP and extract it into a writable folder. The ZIP contains DFlow Tray (`dflow-tray.exe`) and DFlow Scratchpad (`dflow.exe`). Each executable is also available individually. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
+Download the Windows ZIP and extract it into a writable folder. Choose **DFlow Dictation** (`dflow-dictation.exe`) to dictate into other apps or **DFlow Scratchpad** (`dflow.exe`) to dictate into a saved note. Each executable is also available individually. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
 
 Already signed in to Codex CLI with ChatGPT on this PC? DFlow uses that login. To sign in for the first time or renew the session, run `codex login` and complete the browser sign-in with your ChatGPT account. [OpenAI's Codex sign-in guide](https://learn.chatgpt.com/docs/auth)
 
-When upgrading, close both apps before replacing the executables. Keep the `config` and `cache` folders to preserve your settings and saved note.
+When upgrading, close both apps before replacing the executables. Keep the `config` and `cache` folders to preserve your settings and saved note. If you used `dflow-tray.exe`, launch `dflow-dictation.exe` instead and re-enable **Start with Windows** in its Settings if you used that option.
 
-## Dictate from the tray
+## Dictate into other apps
 
-1. Launch `dflow-tray.exe`. DFlow Tray runs in the Windows notification area.
+1. Launch `dflow-dictation.exe`. DFlow Dictation runs in the Windows notification area.
 2. Place the caret where you want the text. Press **Ctrl+Shift+/** to start dictation, then press it again to finish. The default shortcut uses the slash/question-mark key on a US keyboard.
-3. DFlow can insert single-line text into the original supported Windows edit control. For other apps, multiline results, or a focus change, choose **Copy last transcript** from the tray menu and paste it where you want it.
+3. DFlow inserts single-line text at the original caret in a supported field, including Windows Notepad. If the field is missing, unsupported, or loses focus, DFlow switches to Clipboard mode. The live preview appears as soon as words are ready and grows to fit up to three lines. The shortcut above it says **Cancel** for the first two seconds and **Stop** once the recording is long enough to copy. Use **Cancel recording** in the tray menu to discard it at any time.
 
-Open **Settings** from the tray icon to change the shortcut or enable **Start with Windows**. The tray keeps the latest transcript in memory for the current session. To bring it into the scratchpad, copy it from the tray menu and paste it into the note.
+Open **Settings** from the tray icon to change the shortcut or enable **Start with Windows**. **Copy last transcript** retrieves the latest result from the current session, including multiline results that could not be inserted.
 
 ## Capture and edit in the scratchpad
 
-Run `.\dflow.exe` in PowerShell 7 under Windows Terminal. Type directly in the note, or use **Ctrl+Space** to dictate at the caret. DFlow saves the note and caret as you work and restores both when you reopen it.
+Run `.\dflow.exe` in PowerShell 7 under Windows Terminal. Click in the note to place the caret or drag to select text. Type directly in the note, or use **Ctrl+Space** to dictate at the caret. DFlow saves the note and caret as you work and restores both when you reopen it.
 
 | Shortcut | Action |
 | --- | --- |
@@ -34,7 +34,7 @@ Run `.\dflow.exe` in PowerShell 7 under Windows Terminal. Type directly in the n
 | **Shift+arrows**, **Shift+Home/End** | Extend or shrink the selection. |
 | **Ctrl+Shift+Left/Right**, **Ctrl+Shift+Home/End** | Select by word or to the start or end of the note. |
 | **Ctrl+Z**, **Ctrl+Y** | Undo or redo an edit. |
-| **Ctrl+C** | Copy the selection, or the whole note if there is no selection. Windows Terminal also handles its own selections. |
+| **Ctrl+C** | Copy the selection, or the whole note if there is no selection. Only line breaks in the actual note are copied. |
 | **Ctrl+X** | Cut the selection, or the whole note if there is no selection. DFlow removes the text after the clipboard write succeeds if the note is still current. Undo restores the cut. |
 | **Ctrl+/** | Open the command menu. Type to filter, use arrows to select, Tab to complete, and Enter to run. |
 
@@ -78,4 +78,4 @@ With Rust and Cargo installed on Windows, run this from the repository root.
 cargo build --release --locked --bins
 ```
 
-Launch `target\release\dflow-tray.exe` for the tray or run `.\target\release\dflow.exe` in Windows Terminal for the scratchpad.
+Launch `target\release\dflow-dictation.exe` for dictation into other apps or run `.\target\release\dflow.exe` in Windows Terminal for the scratchpad.

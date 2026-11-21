@@ -11,7 +11,7 @@ name = "dflow"
 path = "src/main.rs"
 
 [[bin]]
-name = "dflow-tray"
+name = "dflow-dictation"
 path = "src/tray/main.rs"
 
 [dependencies]

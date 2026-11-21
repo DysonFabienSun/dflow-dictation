@@ -22,7 +22,7 @@ impl NoteRow {
             let index = self.carets.partition_point(|&(caret, _)| caret < offset);
             match self.carets.get(index) {
                 Some(&(caret, _)) if Some(caret) == self.newline => self.text_width,
-                Some(&(_, column)) => column,
+                Some(&(_, column)) => column.min(self.text_width),
                 None => self.text_width + usize::from(self.newline.is_some()),
             }
         };
@@ -34,15 +34,29 @@ pub fn note_rows(text: &str, width: usize) -> Vec<NoteRow> {
     let width = width.max(1);
     let mut rows = vec![NoteRow::default()];
     let mut column = 0;
-    for (offset, grapheme) in text.grapheme_indices(true) {
+    let mut after_word = false;
+    let mut wrap_at = None;
+    let mut graphemes = text.grapheme_indices(true);
+    while let Some((offset, grapheme)) = graphemes.next() {
         if grapheme == "\n" {
             let row = rows.last_mut().unwrap();
             row.carets.push((offset, column.min(width - 1)));
             row.newline = Some(offset);
             rows.push(NoteRow::default());
             column = 0;
+            after_word = false;
             continue;
         }
+        if wrap_at == Some(offset) {
+            rows.push(NoteRow::default());
+            column = 0;
+            wrap_at = None;
+        }
+        let space = wrap_space(grapheme);
+        if space && after_word {
+            wrap_at = wrapped_word_start(grapheme.width(), graphemes.clone(), width, column);
+        }
+        after_word = !space;
         let grapheme = if grapheme.width() > width {
             "?"
         } else {
@@ -50,11 +64,17 @@ pub fn note_rows(text: &str, width: usize) -> Vec<NoteRow> {
         };
         let cells = grapheme.width();
         if column + cells > width {
+            if wrap_at.is_some() {
+                // Keep offsets for separators that fall beyond the visible end of the row.
+                rows.last_mut().unwrap().carets.push((offset, width));
+                column = width;
+                continue;
+            }
             rows.push(NoteRow::default());
             column = 0;
         }
         let row = rows.last_mut().unwrap();
-        row.carets.push((offset, column.min(width - 1)));
+        row.carets.push((offset, column));
         row.text.push_str(grapheme);
         column += cells;
         row.text_width = column;
@@ -65,6 +85,33 @@ pub fn note_rows(text: &str, width: usize) -> Vec<NoteRow> {
     }
     rows.last_mut().unwrap().carets.push((text.len(), column));
     rows
+}
+
+fn wrap_space(grapheme: &str) -> bool {
+    grapheme.chars().next().is_some_and(|ch| {
+        ch.is_whitespace() && !matches!(ch, '\n' | '\r' | '\u{a0}' | '\u{2007}' | '\u{202f}')
+    })
+}
+
+fn wrapped_word_start(
+    mut gap: usize,
+    graphemes: unicode_segmentation::GraphemeIndices<'_>,
+    width: usize,
+    column: usize,
+) -> Option<usize> {
+    let mut lookahead = graphemes.peekable();
+    while let Some((_, space)) = lookahead.next_if(|&(_, grapheme)| wrap_space(grapheme)) {
+        gap += space.width();
+    }
+    let &(start, first) = lookahead.peek()?;
+    if first == "\n" {
+        return None;
+    }
+    let cells: usize = lookahead
+        .take_while(|&(_, grapheme)| grapheme != "\n" && !wrap_space(grapheme))
+        .map(|(_, grapheme)| grapheme.width())
+        .sum();
+    (column + gap + cells.min(width) > width).then_some(start)
 }
 
 pub fn caret_position(rows: &[NoteRow], cursor: usize) -> (usize, usize) {
@@ -142,6 +189,29 @@ impl Editor {
 
     pub fn clear_selection(&mut self) {
         self.anchor = None;
+    }
+
+    pub fn point_caret(&mut self, row: usize, column: usize, width: usize, extend: bool) {
+        self.end_burst();
+        if extend {
+            self.anchor.get_or_insert(self.note.cursor);
+        } else {
+            self.clear_selection();
+        }
+        let rows = note_rows(self.text(), width);
+        self.note.cursor = match rows.get(row) {
+            Some(row_layout) if column < row_layout.text_width => {
+                let index = row_layout.carets.partition_point(|&(offset, cell)| {
+                    Some(offset) != row_layout.newline && cell <= column
+                }) - 1;
+                row_layout.carets[index].0
+            }
+            Some(row_layout) => row_layout.newline.unwrap_or_else(|| {
+                rows.get(row + 1)
+                    .map_or(self.text().len(), |next| next.carets[0].0)
+            }),
+            None => self.text().len(),
+        };
     }
 
     pub fn move_caret(&mut self, movement: Movement, extend: bool, width: usize) {
@@ -382,6 +452,7 @@ impl Editor {
     fn vertical(&mut self, down: bool, width: usize) {
         let rows = note_rows(self.text(), width);
         let (row, column) = caret_position(&rows, self.cursor());
+        let column = column.min(width.saturating_sub(1));
         let target = if down {
             rows.get(row + 1)
         } else {
@@ -482,6 +553,25 @@ mod tests {
         editor.edit_burst(BurstKind::Typing, start, |e| e.insert("x"));
         assert!(!editor.redo());
         assert_eq!(editor.text(), "onxtwo");
+    }
+
+    #[test]
+    fn word_wrap_preserves_separators_and_keeps_words_together() {
+        let text = "hello  world\nhi 界面好";
+        let rows = note_rows(text, 7);
+        let visible: Vec<_> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(visible, ["hello  ", "world", "hi ", "界面好"]);
+
+        let mut editor = Editor::from_note(text.into(), 0);
+        // The first row has no room to display the separating spaces at width 5.
+        editor.point_caret(0, 4, 5, false);
+        assert_eq!(editor.cursor(), 4);
+        editor.point_caret(1, 2, 5, true);
+        assert_eq!(&editor.text()[editor.selection().unwrap()], "o  wo");
+
+        let rows = note_rows("hi abcdefghij", 5);
+        let visible: Vec<_> = rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(visible, ["hi ", "abcde", "fghij", ""]);
     }
 
     #[test]

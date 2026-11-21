@@ -14,5 +14,5 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("DFlow Tray requires Windows.");
+    eprintln!("DFlow Dictation requires Windows.");
 }

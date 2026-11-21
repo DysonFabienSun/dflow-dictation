@@ -2,8 +2,10 @@
 
 Download the Windows ZIP under **Assets** and extract it into a writable folder. Each app is also available as a separate download. To upgrade, close both apps before replacing the executables in your existing folder. Keep the `config` and `cache` folders to retain your settings and scratchpad note.
 
-- **DFlow Scratchpad** opens when you run `.\dflow.exe` in PowerShell 7 under Windows Terminal. Press **Ctrl+Space** to dictate into the note and **Ctrl+C** to copy it. The scratchpad saves the note and caret between launches.
-- **DFlow Tray (`dflow-tray.exe`)** runs in the Windows notification area. Place the caret in the app you want to dictate into and press **Ctrl+Shift+/** to start and finish recording. The tray can insert single-line text directly into supported Windows edit controls. For other apps, multiline results, or a focus change, choose **Copy last transcript** from the tray menu and paste it where you want it.
+- **DFlow Scratchpad (`dflow.exe`)** opens a saved note in PowerShell 7 under Windows Terminal. Click to place the caret, drag to select text, press **Ctrl+Space** to dictate, and press **Ctrl+C** to copy.
+- **DFlow Dictation (`dflow-dictation.exe`)** runs in the Windows notification area and dictates into other apps. Place the caret and press **Ctrl+Shift+/** to start and finish recording. DFlow inserts single-line text into supported fields, including Windows Notepad. In **Clipboard mode**, stop within two seconds to discard, or keep speaking to see a preview and stop to copy the final transcript.
+
+If you used `dflow-tray.exe`, launch `dflow-dictation.exe` instead and re-enable **Start with Windows** in its Settings if you used that option.
 
 ## Use the two apps together
 

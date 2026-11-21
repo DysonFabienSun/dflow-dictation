@@ -19,6 +19,7 @@ const NOTE_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
+    app.note_area = Rect::ZERO;
     if screen.is_empty() {
         return;
     }
@@ -30,7 +31,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         screen.height,
     );
     let mut footer = Rect::new(content.x, content.bottom() - 1, content.width, 1);
-    app.note_width = usize::from(content.width);
     let available = content.height.saturating_sub(1);
     let mut panel = match app.panes.last() {
         Some(Pane::Menu(menu)) => menu_lines(menu, content.width, available.saturating_sub(1)),
@@ -60,6 +60,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     panel.truncate(available.saturating_sub(1) as usize);
     let note_height = available.saturating_sub(panel.len() as u16);
     let note_area = Rect::new(content.x, content.y, content.width, note_height);
+    app.note_area = note_area;
     if !note_area.is_empty() {
         draw_note(frame, app, note_area);
     }
@@ -116,7 +117,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
-    let rows = note_rows(app.editor.text(), app.note_width);
+    let rows = note_rows(app.editor.text(), usize::from(area.width));
     let (cursor_row, cursor_column) = caret_position(&rows, app.editor.cursor());
     let height = area.height as usize;
     let top = app.top_row.min(rows.len().saturating_sub(height));
@@ -151,7 +152,7 @@ fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     if app.panes.is_empty() {
         frame.set_cursor_position(Position::new(
-            area.x + cursor_column as u16,
+            area.x + cursor_column.min(usize::from(area.width - 1)) as u16,
             area.y + (cursor_row - app.top_row) as u16,
         ));
     }

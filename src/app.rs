@@ -7,7 +7,10 @@ use crate::{
     editor::{BurstKind, Editor, Movement},
     transcript::clean_text,
 };
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::{Position, Rect};
 use std::{
     ops::Range,
     path::PathBuf,
@@ -218,7 +221,7 @@ pub struct App {
     pub editor: Editor,
     pub panes: Vec<Pane>,
     pub top_row: usize,
-    pub note_width: usize,
+    pub note_area: Rect,
     pub quit: bool,
     config: Config,
     clipboard: Clipboard,
@@ -226,6 +229,7 @@ pub struct App {
     device_scan: Option<Receiver<DeviceList>>,
     dictation: Option<Dictation>,
     space_down: bool,
+    mouse_selecting: bool,
     notice: Option<String>,
     copied: Option<(usize, Instant)>,
     revision: u64,
@@ -245,7 +249,7 @@ impl App {
             editor: Editor::default(),
             panes: Vec::new(),
             top_row: 0,
-            note_width: 1,
+            note_area: Rect::ZERO,
             quit: false,
             config,
             clipboard: Clipboard::new(),
@@ -253,6 +257,7 @@ impl App {
             device_scan: None,
             dictation: None,
             space_down: false,
+            mouse_selecting: false,
             notice: None,
             copied: None,
             revision: 0,
@@ -399,8 +404,15 @@ impl App {
 
     pub fn event(&mut self, event: Event) {
         match event {
-            Event::Key(key) => self.key(key),
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Release {
+                    self.mouse_selecting = false;
+                }
+                self.key(key);
+            }
+            Event::Mouse(mouse) => self.mouse(mouse),
             Event::Paste(text) if self.dictation.is_none() => {
+                self.mouse_selecting = false;
                 let text = clean_text(&text);
                 if let Some(Pane::TextInput { text: input, .. }) = self.panes.last_mut() {
                     if !text.contains('\n') {
@@ -412,6 +424,7 @@ impl App {
                 }
             }
             Event::FocusLost => {
+                self.mouse_selecting = false;
                 self.editor.end_burst();
                 self.space_down = false;
                 if self.dictation.as_ref().is_some_and(|d| {
@@ -422,6 +435,34 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn mouse(&mut self, mouse: MouseEvent) {
+        let area = self.note_area;
+        if area.is_empty() || self.dictation.is_some() || !self.panes.is_empty() {
+            self.mouse_selecting = false;
+            return;
+        }
+        let extend = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.mouse_selecting = area.contains(Position::new(mouse.column, mouse.row));
+                if !self.mouse_selecting {
+                    return;
+                }
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.mouse_selecting => true,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.mouse_selecting = false;
+                return;
+            }
+            _ => return,
+        };
+        let row = self.top_row + usize::from(mouse.row.saturating_sub(area.y));
+        let column = usize::from(mouse.column.saturating_sub(area.x));
+        self.notice = None;
+        self.editor
+            .point_caret(row, column, usize::from(area.width), extend);
     }
 
     fn key(&mut self, key: KeyEvent) {
@@ -507,7 +548,7 @@ impl App {
                 self.editor.move_caret(
                     movement,
                     key.modifiers.contains(KeyModifiers::SHIFT),
-                    self.note_width,
+                    usize::from(self.note_area.width),
                 );
                 return;
             }
@@ -1099,6 +1140,48 @@ fn commands(slash_prompt: bool) -> Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_places_caret_and_copies_only_real_line_breaks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        let (clipboard, notes, _report) = Clipboard::test_sink();
+        app.clipboard = clipboard;
+        app.note_area = Rect::new(1, 0, 4, 4);
+        app.editor.insert("ab界cd\nefgh\nij");
+        let mouse = |kind, column, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let left = MouseButton::Left;
+
+        app.event(mouse(MouseEventKind::Down(left), 4, 2));
+        app.event(mouse(MouseEventKind::Up(left), 4, 2));
+        assert_eq!(&app.editor.text()[app.editor.cursor()..], "h\nij");
+        assert_eq!(app.editor.selection(), None);
+
+        app.event(mouse(MouseEventKind::Down(left), 2, 0));
+        app.event(mouse(MouseEventKind::Drag(left), 3, 2));
+        app.event(mouse(MouseEventKind::Up(left), 3, 2));
+        app.event(Event::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(
+            notes.recv_timeout(Duration::from_secs(1)).unwrap().text,
+            "b界cd\nef"
+        );
+
+        app.event(mouse(MouseEventKind::Down(left), 2, 4));
+        assert_eq!(
+            &app.editor.text()[app.editor.selection().unwrap()],
+            "b界cd\nef"
+        );
+    }
 
     #[test]
     fn clipboard_shortcuts_copy_cut_and_undo() {

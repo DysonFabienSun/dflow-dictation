@@ -1,10 +1,10 @@
 #include <windows.h>
 
-1 ICON "assets/dflow.ico"
+1 ICON "assets/dflow-dictation.ico"
 
 100 DIALOGEX 0, 0, 276, 139
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "DFlow Tray Settings"
+CAPTION "DFlow Dictation Settings"
 FONT 9, "Segoe UI"
 BEGIN
     LTEXT "Dictation shortcut", -1, 8, 10, 85, 10

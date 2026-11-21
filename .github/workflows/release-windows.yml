@@ -41,7 +41,7 @@ jobs:
       - name: Package both Windows apps
         shell: pwsh
         run: |
-          $executables = './target/release/dflow.exe', './target/release/dflow-tray.exe'
+          $executables = './target/release/dflow.exe', './target/release/dflow-dictation.exe'
           foreach ($exe in $executables) {
             if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
               throw "Missing Windows release executable $exe."
@@ -79,5 +79,5 @@ jobs:
           Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM -NoNewline -ErrorAction Stop
 
           $archive = Join-Path $env:RUNNER_TEMP "DFlow-$env:RELEASE_TAG-windows.zip"
-          gh release create "$env:RELEASE_TAG" "$archive" ./target/release/dflow.exe ./target/release/dflow-tray.exe --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
+          gh release create "$env:RELEASE_TAG" "$archive" ./target/release/dflow.exe ./target/release/dflow-dictation.exe --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }

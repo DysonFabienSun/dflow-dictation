@@ -7,7 +7,7 @@ use dflow_scratchpad::{audio, clipboard, codex, config, editor, transcript};
 
 use crossterm::{
     cursor::Show,
-    event::{self, DisableFocusChange, EnableFocusChange},
+    event::{self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -61,12 +61,14 @@ impl Screen {
             _input_mode: input_mode,
         };
         execute!(io::stdout(), EnterAlternateScreen, EnableFocusChange)?;
+        execute!(io::stdout(), EnableMouseCapture)?;
         Ok(guard)
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen, Show);
         #[cfg(not(windows))]
         let _ = terminal::disable_raw_mode();
@@ -158,7 +160,7 @@ fn main() -> std::process::ExitCode {
         match first.to_str() {
             Some("--help" | "-h") if arguments.next().is_none() => {
                 println!(
-                    "DFlow · Dictation scratchpad\n\nUsage: dflow [--no-agent-access]\n       dflow --mcp\n\nOpen DFlow in PowerShell 7 under Windows Terminal.\nCtrl+Space dictates and Esc opens commands.\nCtrl+Z undoes, Ctrl+Y redoes, Ctrl+C copies, and Ctrl+X cuts.\nUse :q or /quit from the command menu to exit."
+                    "DFlow Scratchpad\n\nUsage: dflow [--no-agent-access]\n       dflow --mcp\n\nOpen DFlow Scratchpad in PowerShell 7 under Windows Terminal.\nClick to place the caret or drag to select text.\nCtrl+Space dictates and Esc opens commands.\nCtrl+Z undoes, Ctrl+Y redoes, Ctrl+C copies, and Ctrl+X cuts.\nUse :q or /quit from the command menu to exit."
                 );
                 return ExitCode::SUCCESS;
             }
