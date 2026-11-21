@@ -38,8 +38,10 @@ jobs:
           cargo build --locked --release --bins
           if ($LASTEXITCODE -ne 0) { throw 'Cargo release build failed.' }
 
-      - name: Package both Windows apps
+      - name: Create a draft release with both apps and setup instructions
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $executables = './target/release/dflow.exe', './target/release/dflow-dictation.exe'
           foreach ($exe in $executables) {
@@ -47,14 +49,7 @@ jobs:
               throw "Missing Windows release executable $exe."
             }
           }
-          $archive = Join-Path $env:RUNNER_TEMP "DFlow-$env:RELEASE_TAG-windows.zip"
-          Compress-Archive -LiteralPath $executables -DestinationPath $archive -Force -ErrorAction Stop
 
-      - name: Create a draft release with both apps and setup instructions
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
           # Restore the original tag object so gh can read its annotation.
           $tagRef = "refs/tags/$env:RELEASE_TAG"
           git fetch --force --no-tags origin "${tagRef}:${tagRef}"
@@ -78,6 +73,5 @@ jobs:
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM -NoNewline -ErrorAction Stop
 
-          $archive = Join-Path $env:RUNNER_TEMP "DFlow-$env:RELEASE_TAG-windows.zip"
-          gh release create "$env:RELEASE_TAG" "$archive" ./target/release/dflow.exe ./target/release/dflow-dictation.exe --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
+          gh release create "$env:RELEASE_TAG" @executables --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }
