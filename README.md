@@ -2,11 +2,15 @@
 
 <img src="assets/dflow.svg" alt="DFlow icon" width="72">
 
-DFlow is keyboard-first dictation for Windows. Use a global hotkey to dictate from the tray, or capture, edit, and save text in the scratchpad. Both apps use your existing Codex CLI login for dictation.
+**ChatGPT-powered dictation for Windows using the subscription you already have.** DFlow reuses your ChatGPT sign-in from Codex CLI, including accounts on ChatGPT Plus or Pro. There's no separate DFlow subscription or OpenAI API key to set up.
+
+Use a global hotkey to dictate from the tray, or capture, edit, and save text in the scratchpad. Both apps send audio to ChatGPT's speech-to-text service and can refine earlier wording as more of the sentence comes in.
 
 ## Install on Windows
 
 Download the Windows ZIP and extract it into a writable folder. The ZIP contains DFlow Tray (`dflow-tray.exe`) and DFlow Scratchpad (`dflow.exe`). Each executable is also available individually. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
+
+Already signed in to Codex CLI with ChatGPT on this PC? DFlow uses that login. To sign in for the first time or renew the session, run `codex login` and complete the browser sign-in with your ChatGPT account. [OpenAI's Codex sign-in guide](https://learn.chatgpt.com/docs/auth)
 
 When upgrading, close both apps before replacing the executables. Keep the `config` and `cache` folders to preserve your settings and saved note.
 
