@@ -142,7 +142,7 @@ impl Config {
     }
 
     pub fn save(&mut self, settings: Settings) -> Result<(), String> {
-        self.save_with_hotkey(settings, None)
+        self.save_with_tray(settings, None)
     }
 
     pub fn tray_hotkey(&self) -> Result<Hotkey, String> {
@@ -151,14 +151,29 @@ impl Config {
             .unwrap_or_else(|| Ok(Hotkey::default()))
     }
 
-    pub fn save_tray(&mut self, settings: Settings, hotkey: Hotkey) -> Result<(), String> {
-        self.save_with_hotkey(settings, Some(hotkey))
+    pub fn tray_launch_preview(&self) -> Result<bool, String> {
+        table(&self.document, "tray")?
+            .and_then(|table| table.get("show_launch_preview"))
+            .map(|item| {
+                item.as_bool()
+                    .ok_or_else(|| "tray.show_launch_preview must be true or false.".into())
+            })
+            .unwrap_or(Ok(true))
     }
 
-    fn save_with_hotkey(
+    pub fn save_tray(
         &mut self,
         settings: Settings,
-        hotkey: Option<Hotkey>,
+        hotkey: Hotkey,
+        show_launch_preview: bool,
+    ) -> Result<(), String> {
+        self.save_with_tray(settings, Some((hotkey, show_launch_preview)))
+    }
+
+    fn save_with_tray(
+        &mut self,
+        settings: Settings,
+        tray: Option<(Hotkey, bool)>,
     ) -> Result<(), String> {
         if self.error.is_some() {
             return Err(format!(
@@ -167,9 +182,10 @@ impl Config {
             ));
         }
         let mut document = self.document.clone();
-        if let Some(hotkey) = hotkey {
+        if let Some((hotkey, show_launch_preview)) = tray {
             table(&document, "tray")?;
             set_optional(&mut document, "tray", "hotkey", Some(&hotkey.to_string()));
+            document["tray"]["show_launch_preview"] = value(show_launch_preview);
         }
         set_optional(
             &mut document,
@@ -317,7 +333,9 @@ mod tests {
         let alternate = "Ctrl+Shift+F2".parse().unwrap();
         let mut tray = Config::load(tray);
         assert_eq!(tray.tray_hotkey().unwrap(), Hotkey::default());
-        tray.save_tray(tray.settings.clone(), alternate).unwrap();
+        assert!(tray.tray_launch_preview().unwrap());
+        tray.save_tray(tray.settings.clone(), alternate, false)
+            .unwrap();
         let mut scratchpad = Config::load(scratchpad);
         let mut settings = scratchpad.settings.clone();
         settings.hold_delay_ms = 300;
@@ -325,6 +343,7 @@ mod tests {
         let shared = Config::load(scratchpad.path);
         assert_eq!(shared.settings.hold_delay_ms, 300);
         assert_eq!(shared.tray_hotkey().unwrap(), alternate);
+        assert!(!shared.tray_launch_preview().unwrap());
         assert_eq!(
             Config::load(separate).tray_hotkey().unwrap(),
             Hotkey::default()

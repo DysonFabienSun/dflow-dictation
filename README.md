@@ -18,7 +18,7 @@ When upgrading, close both apps before replacing the executables. Keep the `conf
 
 ### DFlow Dictation (`dflow-dictation.exe`)
 
-1. Launch `dflow-dictation.exe`. It starts in the Windows system tray without opening a main window. Use the tray icon to open **Settings** or choose **Copy last transcript**.
+1. Launch `dflow-dictation.exe`. The tray app shows a seven-second shortcut guide. Select **Dismiss** to close it early, or turn off **Show launch preview** in **Settings**. Use the tray icon to open **Settings** or choose **Copy last transcript**.
 2. Press **Ctrl+Shift+/** to start dictation. The default shortcut uses the slash/question-mark key on a US keyboard. The live preview appears as soon as words are ready and grows to fit up to three lines.
 3. Press the shortcut again within two seconds to discard the recording. After two seconds, press it to stop and copy the full transcript when it’s ready. You can also click **Cancel** or **Stop & Copy** above the live preview. Use **Cancel recording** in the tray menu to discard at any time.
 

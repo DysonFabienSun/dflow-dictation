@@ -22,6 +22,7 @@ const AUTH: i32 = 103;
 const PROXY_ON: i32 = 104;
 const PROXY_URL: i32 = 105;
 const STARTUP: i32 = 106;
+const LAUNCH_PREVIEW: i32 = 107;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "DFlow Tray";
 
@@ -147,6 +148,11 @@ impl Dialog {
             STARTUP,
             self.startup.as_deref() == Some(&self.command),
         );
+        check(
+            hwnd,
+            LAUNCH_PREVIEW,
+            self.config.tray_launch_preview().unwrap_or(true),
+        );
         self.set_devices(hwnd, Ok(Vec::new()));
         unsafe {
             SetTimer(hwnd, 1, 50, None);
@@ -235,7 +241,12 @@ impl Dialog {
             };
             Some(Binding::register(self.owner, hotkey, id)?)
         };
-        let result = self.save_changes(settings, hotkey, checked(hwnd, STARTUP));
+        let result = self.save_changes(
+            settings,
+            hotkey,
+            checked(hwnd, STARTUP),
+            checked(hwnd, LAUNCH_PREVIEW),
+        );
         if let Err(error) = result {
             if let Some(binding) = next {
                 unsafe {
@@ -260,6 +271,7 @@ impl Dialog {
         settings: dflow_scratchpad::config::Settings,
         hotkey: Hotkey,
         startup: bool,
+        show_launch_preview: bool,
     ) -> Result<(), String> {
         let desired = if startup {
             Some(self.command.as_str())
@@ -273,7 +285,7 @@ impl Dialog {
             write_startup(desired)
                 .map_err(|error| format!("Could not change Start with Windows. {error}"))?;
         }
-        if let Err(error) = self.config.save_tray(settings, hotkey) {
+        if let Err(error) = self.config.save_tray(settings, hotkey, show_launch_preview) {
             if changed && let Err(restore) = write_startup(self.startup.as_deref()) {
                 return Err(format!(
                     "{error}\nCould not restore Start with Windows. {restore}"
