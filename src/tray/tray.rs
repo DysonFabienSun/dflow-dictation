@@ -21,8 +21,6 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
     System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
-        Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
-        Controls::EM_REPLACESEL,
         HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
             GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
@@ -36,11 +34,12 @@ use windows_sys::Win32::{
 const TRAY: u32 = WM_APP + 1;
 const OPEN_MENU: u32 = WM_APP + 2;
 const RESTORE_ICON: u32 = WM_APP + 3;
+const PREVIEW_ACTION: u32 = WM_APP + 4;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const SS_CENTER: u32 = 1;
 const SS_CENTERIMAGE: u32 = 0x200;
 const SS_NOPREFIX: u32 = 0x80;
-const COPY_MODE_DELAY: Duration = Duration::from_secs(2);
+const CANCEL_WINDOW: Duration = Duration::from_secs(2);
 const PREVIEW_LINES: usize = 3;
 const SHORTCUT_HEIGHT: i32 = 18;
 const TIMER: usize = 1;
@@ -50,7 +49,6 @@ const COPY: u32 = 3;
 const EXIT: u32 = 4;
 
 thread_local! {
-    static FOCUS_CHANGES: Cell<u64> = const { Cell::new(0) };
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -71,58 +69,10 @@ impl Binding {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Target {
-    window: HWND,
-    control: HWND,
-    changes: u64,
-}
-
-impl Target {
-    fn focused() -> Option<Self> {
-        let window = unsafe { GetForegroundWindow() };
-        if window.is_null() || unsafe { GetWindowThreadProcessId(window, null_mut()) } == 0 {
-            return None;
-        }
-        let mut info = GUITHREADINFO {
-            cbSize: size_of::<GUITHREADINFO>() as u32,
-            ..Default::default()
-        };
-        if unsafe { GetGUIThreadInfo(0, &mut info) } == 0
-            || info.hwndFocus.is_null()
-            || unsafe { GetAncestor(info.hwndFocus, GA_ROOT) } != window
-        {
-            return None;
-        }
-        Some(Self {
-            window,
-            control: info.hwndFocus,
-            changes: FOCUS_CHANGES.get(),
-        })
-    }
-}
-
-unsafe extern "system" fn focus_event(
-    _: HWINEVENTHOOK,
-    event: u32,
-    hwnd: HWND,
-    _: i32,
-    _: i32,
-    _: u32,
-    _: u32,
-) {
-    if event == EVENT_SYSTEM_FOREGROUND
-        || (!hwnd.is_null() && unsafe { GetAncestor(hwnd, GA_ROOT) == GetForegroundWindow() })
-    {
-        FOCUS_CHANGES.set(FOCUS_CHANGES.get().wrapping_add(1));
-    }
-}
-
 struct Recording {
     session: Session,
-    target: Option<Target>,
-    copy_mode_since: Option<Instant>,
-    copy_ready: bool,
+    started_at: Instant,
+    can_stop: bool,
     listening: bool,
     quiet: bool,
     finishing: bool,
@@ -130,33 +80,20 @@ struct Recording {
 }
 
 impl Recording {
-    fn check_target(&mut self, now: Instant) -> bool {
-        if let Some(target) = self.target
-            && (Target::focused() != Some(target) || !supports_insertion(target.control))
-        {
-            self.target = None;
-            self.copy_mode_since = Some(now);
-            return true;
-        }
-        false
-    }
-
-    fn update_copy_mode(&mut self, now: Instant) -> bool {
+    fn update_cancel_window(&mut self, now: Instant) -> bool {
         if !self.finishing
-            && !self.copy_ready
-            && self
-                .copy_mode_since
-                .is_some_and(|since| now.saturating_duration_since(since) >= COPY_MODE_DELAY)
+            && !self.can_stop
+            && now.saturating_duration_since(self.started_at) >= CANCEL_WINDOW
         {
-            self.copy_ready = true;
+            self.can_stop = true;
             return true;
         }
         false
     }
 
     fn finish_requested(&mut self, now: Instant) -> bool {
-        self.update_copy_mode(now);
-        if self.target.is_none() && !self.copy_ready {
+        self.update_cancel_window(now);
+        if !self.can_stop {
             return false;
         }
         self.finishing = true;
@@ -165,13 +102,15 @@ impl Recording {
     }
 
     fn previewing(&self) -> bool {
-        self.copy_mode_since.is_some()
-            && (!self.finishing || self.copy_ready)
-            && !self.transcript.trim().is_empty()
+        !self.transcript.trim().is_empty()
     }
 
     fn preview_shortcut_label(&self, hotkey: Hotkey) -> String {
-        let action = if self.copy_ready { "STOP" } else { "CANCEL" };
+        let action = if self.can_stop {
+            "STOP & COPY"
+        } else {
+            "CANCEL"
+        };
         format!("{action} · {}", hotkey.to_string().to_ascii_uppercase())
     }
 
@@ -188,27 +127,13 @@ impl Recording {
         } else {
             "Starting microphone…"
         };
-        if self.target.is_some() || self.finishing {
-            activity.into()
-        } else if self.copy_ready && self.listening && !self.quiet {
+        if !self.can_stop {
+            format!("{activity} · Stop now to discard")
+        } else if !self.finishing && self.listening && !self.quiet {
             "Listening… · Waiting for transcript".into()
-        } else if self.copy_ready {
-            activity.into()
         } else {
-            format!("{activity} · Clipboard mode · Stop now to discard")
+            activity.into()
         }
-    }
-
-    fn finish(self, now: Instant) -> Option<Delivery> {
-        if self.transcript.trim().is_empty() {
-            return None;
-        }
-        Some(Delivery {
-            target: self.target,
-            text: self.transcript,
-            copy: self.copy_ready,
-            deadline: now + Duration::from_secs(2),
-        })
     }
 }
 
@@ -247,42 +172,6 @@ fn transcript_preview(text: &str, mut fits: impl FnMut(&str) -> bool) -> String 
     rows.make_contiguous().join("\r\n")
 }
 
-struct Delivery {
-    target: Option<Target>,
-    text: String,
-    copy: bool,
-    deadline: Instant,
-}
-
-#[derive(PartialEq, Eq)]
-enum DeliveryAction {
-    Wait,
-    Insert,
-    Copy,
-    Keep,
-}
-
-impl Delivery {
-    fn action(&self, focus: Option<Target>, modifiers_down: bool, now: Instant) -> DeliveryAction {
-        if self.copy {
-            DeliveryAction::Copy
-        } else if self.target.is_none()
-            || self.target != focus
-            || self.text.contains(['\r', '\n', '\0'])
-        {
-            DeliveryAction::Keep
-        } else if modifiers_down {
-            if now < self.deadline {
-                DeliveryAction::Wait
-            } else {
-                DeliveryAction::Keep
-            }
-        } else {
-            DeliveryAction::Insert
-        }
-    }
-}
-
 struct App {
     hwnd: HWND,
     pill: HWND,
@@ -292,13 +181,11 @@ struct App {
     path: PathBuf,
     binding: Option<Binding>,
     recording: Option<Recording>,
-    delivery: Option<Delivery>,
     last_transcript: Option<String>,
     status_until: Option<Instant>,
     clipboard: Clipboard,
     copies_pending: usize,
     timer: bool,
-    focus_hooks: [HWINEVENTHOOK; 2],
 }
 
 pub fn wide(text: &str) -> Vec<u16> {
@@ -436,17 +323,6 @@ pub fn run() -> Result<(), String> {
         return Err(error);
     }
     TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) });
-    let hooks = [EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_FOCUS].map(|event| unsafe {
-        SetWinEventHook(
-            event,
-            event,
-            null_mut(),
-            Some(focus_event),
-            0,
-            0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
-        )
-    });
     let mut app = App {
         hwnd,
         pill,
@@ -455,13 +331,11 @@ pub fn run() -> Result<(), String> {
         path,
         binding: None,
         recording: None,
-        delivery: None,
         last_transcript: None,
         status_until: None,
         clipboard: Clipboard::new(),
         copies_pending: 0,
         timer: false,
-        focus_hooks: hooks,
         icon: NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
@@ -507,6 +381,9 @@ pub fn run() -> Result<(), String> {
                         .is_some_and(|binding| msg.wParam == binding.id as usize) =>
                 {
                     app.toggle()
+                }
+                PREVIEW_ACTION if msg.lParam as HWND == app.preview_shortcut => {
+                    app.activate_preview_shortcut(msg.wParam != 0);
                 }
                 WM_TIMER if msg.wParam == TIMER => app.tick(),
                 OPEN_MENU => app.menu(),
@@ -590,6 +467,7 @@ fn create_preview_shortcut(pill: HWND) -> HWND {
         lpfnWndProc: Some(preview_shortcut_proc),
         hInstance: instance(),
         lpszClassName: class.as_ptr(),
+        hCursor: unsafe { LoadCursorW(null_mut(), IDC_HAND) },
         ..Default::default()
     };
     unsafe {
@@ -597,7 +475,7 @@ fn create_preview_shortcut(pill: HWND) -> HWND {
             return null_mut();
         }
         let shortcut = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_LAYERED,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED,
             class.as_ptr(),
             null(),
             WS_POPUP,
@@ -625,7 +503,25 @@ unsafe extern "system" fn preview_shortcut_proc(
 ) -> LRESULT {
     unsafe {
         match msg {
-            WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+            WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+            WM_LBUTTONDOWN => {
+                SetCapture(hwnd);
+                0
+            }
+            WM_LBUTTONUP if GetCapture() == hwnd => {
+                ReleaseCapture();
+                let point = POINT {
+                    x: i32::from(lp as i16),
+                    y: i32::from((lp >> 16) as i16),
+                };
+                let mut area = RECT::default();
+                if GetClientRect(hwnd, &mut area) != 0 && PtInRect(&area, point) != 0 {
+                    let owner = GetAncestor(hwnd, GA_ROOTOWNER);
+                    let can_stop = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as WPARAM;
+                    PostMessageW(owner, PREVIEW_ACTION, can_stop, hwnd as LPARAM);
+                }
+                0
+            }
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let dc = BeginPaint(hwnd, &mut paint);
@@ -700,17 +596,13 @@ impl App {
     fn toggle(&mut self) {
         if let Some(recording) = self.recording.as_mut() {
             if !recording.finishing {
-                let now = Instant::now();
-                recording.check_target(now);
-                if recording.finish_requested(now) {
+                if recording.finish_requested(Instant::now()) {
                     self.recording_status();
                 } else {
-                    self.recording.take();
-                    self.hide();
+                    self.cancel_recording();
                 }
             }
-        } else if self.delivery.is_none() {
-            let target = Target::focused().filter(|target| supports_insertion(target.control));
+        } else {
             let config = Config::load(self.path.clone());
             if let Some(error) = config.error {
                 self.notice(&error);
@@ -718,9 +610,8 @@ impl App {
             }
             self.recording = Some(Recording {
                 session: Session::start(config.settings),
-                target,
-                copy_mode_since: target.is_none().then(Instant::now),
-                copy_ready: false,
+                started_at: Instant::now(),
+                can_stop: false,
                 listening: false,
                 quiet: false,
                 finishing: false,
@@ -730,13 +621,30 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
-        let mut redraw = false;
-        if let Some(recording) = &mut self.recording {
-            let now = Instant::now();
-            redraw |= recording.check_target(now);
-            redraw |= recording.update_copy_mode(now);
+    fn activate_preview_shortcut(&mut self, can_stop: bool) {
+        if self
+            .recording
+            .as_ref()
+            .is_some_and(|recording| recording.previewing() && !recording.finishing)
+        {
+            if can_stop {
+                self.toggle();
+            } else {
+                self.cancel_recording();
+            }
         }
+    }
+
+    fn cancel_recording(&mut self) {
+        self.recording.take();
+        self.hide();
+    }
+
+    fn tick(&mut self) {
+        let mut redraw = self
+            .recording
+            .as_mut()
+            .is_some_and(|recording| recording.update_cancel_window(Instant::now()));
         while let Some(recording) = &mut self.recording {
             match recording.session.updates.try_recv() {
                 Ok(Update::Live) if !recording.finishing => {
@@ -754,12 +662,16 @@ impl App {
                 Ok(Update::Live | Update::QuietInput(_)) => {}
                 Ok(Update::Transcript(text)) => {
                     recording.transcript = text;
-                    redraw |= recording.copy_mode_since.is_some();
+                    redraw = true;
                 }
                 Ok(Update::Done) => {
-                    self.delivery = self.recording.take().unwrap().finish(Instant::now());
-                    if self.delivery.is_none() {
+                    let recording = self.recording.take().unwrap();
+                    if recording.transcript.trim().is_empty() {
                         self.notice_for("No speech detected.", Duration::from_secs(1));
+                    } else {
+                        self.hide();
+                        self.last_transcript = Some(recording.transcript);
+                        self.copy_last_transcript();
                     }
                 }
                 Ok(Update::Failed(error)) => self.fail(&error),
@@ -770,32 +682,9 @@ impl App {
         if redraw {
             self.recording_status();
         }
-        if let Some(delivery) = self.delivery.take() {
-            match delivery.action(Target::focused(), modifiers_down(), Instant::now()) {
-                DeliveryAction::Wait => self.delivery = Some(delivery),
-                DeliveryAction::Copy => {
-                    self.hide();
-                    self.last_transcript = Some(delivery.text);
-                    self.copy_last_transcript();
-                }
-                DeliveryAction::Insert
-                    if delivery.target.is_some_and(|target| {
-                        Target::focused() == Some(target)
-                            && insert_text(target.control, &delivery.text)
-                    }) =>
-                {
-                    self.last_transcript = Some(delivery.text);
-                    self.hide()
-                }
-                _ => {
-                    self.last_transcript = Some(delivery.text);
-                    self.notice("Transcript ready · choose Copy last transcript");
-                }
-            }
-        }
         for feedback in self.clipboard.feedback.try_iter().collect::<Vec<_>>() {
             self.copies_pending = self.copies_pending.saturating_sub(1);
-            if self.recording.is_none() && self.delivery.is_none() {
+            if self.recording.is_none() {
                 self.notice(match feedback {
                     ClipboardFeedback::Copied(_) => "Transcript copied.",
                     ClipboardFeedback::Failed => "Could not copy the transcript.",
@@ -831,16 +720,8 @@ impl App {
             return;
         }
         for (id, label, enabled) in [
-            (
-                SETTINGS,
-                "Settings",
-                self.recording.is_none() && self.delivery.is_none(),
-            ),
-            (
-                CANCEL,
-                "Cancel recording",
-                self.recording.is_some() || self.delivery.is_some(),
-            ),
+            (SETTINGS, "Settings", self.recording.is_none()),
+            (CANCEL, "Cancel recording", self.recording.is_some()),
             (
                 COPY,
                 "Copy last transcript",
@@ -882,11 +763,7 @@ impl App {
                     Shell_NotifyIconW(NIM_MODIFY, &self.icon);
                 }
             }
-            CANCEL => {
-                self.recording.take();
-                self.delivery.take();
-                self.hide();
-            }
+            CANCEL => self.cancel_recording(),
             COPY => self.copy_last_transcript(),
             EXIT => unsafe {
                 PostQuitMessage(0);
@@ -906,10 +783,8 @@ impl App {
     }
 
     fn sync_timer(&mut self) {
-        let needed = self.recording.is_some()
-            || self.delivery.is_some()
-            || self.status_until.is_some()
-            || self.copies_pending != 0;
+        let needed =
+            self.recording.is_some() || self.status_until.is_some() || self.copies_pending != 0;
         if needed && !self.timer {
             self.timer = unsafe { SetTimer(self.hwnd, TIMER, 30, None) != 0 };
         } else if !needed && self.timer {
@@ -922,11 +797,7 @@ impl App {
 
     fn indicator(&mut self, text: &str, preview: bool) {
         self.status_until = None;
-        let target = self
-            .recording
-            .as_ref()
-            .and_then(|recording| recording.target)
-            .map_or_else(|| unsafe { GetForegroundWindow() }, |target| target.window);
+        let target = unsafe { GetForegroundWindow() };
         let monitor = unsafe { MonitorFromWindow(target, MONITOR_DEFAULTTOPRIMARY) };
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
@@ -995,14 +866,17 @@ impl App {
         if self.preview_shortcut.is_null() {
             return;
         }
-        let label = if let (Some(binding), Some(recording)) =
+        let (label, can_stop) = if let (Some(binding), Some(recording)) =
             (self.binding, self.recording.as_ref())
             && preview
             && !recording.finishing
         {
-            wide(&recording.preview_shortcut_label(binding.hotkey))
+            (
+                wide(&recording.preview_shortcut_label(binding.hotkey)),
+                recording.can_stop,
+            )
         } else {
-            unsafe { ShowWindow(self.preview_shortcut, SW_HIDE) };
+            self.hide_preview_shortcut();
             return;
         };
         let height = SHORTCUT_HEIGHT * dpi / 96;
@@ -1028,6 +902,7 @@ impl App {
                 ReleaseDC(self.pill, dc);
             }
             let width = length.cx + 18 * dpi / 96;
+            SetWindowLongPtrW(self.preview_shortcut, GWLP_USERDATA, isize::from(can_stop));
             SetWindowTextW(self.preview_shortcut, label.as_ptr());
             SetWindowPos(
                 self.preview_shortcut,
@@ -1102,11 +977,20 @@ impl App {
 
     fn hide(&mut self) {
         self.status_until = None;
+        self.hide_preview_shortcut();
         unsafe {
-            if !self.preview_shortcut.is_null() {
+            ShowWindow(self.pill, SW_HIDE);
+        }
+    }
+
+    fn hide_preview_shortcut(&self) {
+        if !self.preview_shortcut.is_null() {
+            unsafe {
+                if GetCapture() == self.preview_shortcut {
+                    ReleaseCapture();
+                }
                 ShowWindow(self.preview_shortcut, SW_HIDE);
             }
-            ShowWindow(self.pill, SW_HIDE);
         }
     }
 }
@@ -1115,11 +999,6 @@ impl Drop for App {
     fn drop(&mut self) {
         self.recording.take();
         unsafe {
-            for hook in self.focus_hooks {
-                if !hook.is_null() {
-                    UnhookWinEvent(hook);
-                }
-            }
             if let Some(binding) = self.binding {
                 UnregisterHotKey(self.hwnd, binding.id);
             }
@@ -1147,70 +1026,17 @@ fn create_indicator_font(dpi: i32, size: i32) -> HFONT {
     unsafe { CreateFontIndirectW(&font) }
 }
 
-fn modifiers_down() -> bool {
-    [VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
-        .into_iter()
-        .any(|key| unsafe { GetAsyncKeyState(i32::from(key)) < 0 })
-}
-
-fn supports_insertion(control: HWND) -> bool {
-    let mut class = [0; 32];
-    unsafe {
-        if IsWindowUnicode(control) == 0 || IsWindowEnabled(control) == 0 {
-            return false;
-        }
-        let style = GetWindowLongW(control, GWL_STYLE);
-        if style & (ES_READONLY | ES_PASSWORD | ES_NUMBER) != 0 {
-            return false;
-        }
-        let length = GetClassNameW(control, class.as_mut_ptr(), class.len() as i32) as usize;
-        match String::from_utf16_lossy(&class[..length])
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "edit" => {
-                // Bounded Edit controls can truncate text at the visible bounds.
-                let wraps_and_scrolls = ES_MULTILINE | ES_AUTOVSCROLL;
-                style & ES_AUTOHSCROLL != 0 || style & wraps_and_scrolls == wraps_and_scrolls
-            }
-            "richeditd2dpt" | "richeditd2d" | "richedit50w" | "richedit20w" | "richedit20wpt" => {
-                true
-            }
-            _ => false,
-        }
-    }
-}
-
-fn insert_text(control: HWND, text: &str) -> bool {
-    let text = wide(text);
-    if !supports_insertion(control) {
-        return false;
-    }
-    // Address the captured control directly so a foreground switch cannot redirect the text.
-    unsafe {
-        SendMessageTimeoutW(
-            control,
-            EM_REPLACESEL,
-            1,
-            text.as_ptr() as LPARAM,
-            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
-            200,
-            null_mut(),
-        ) != 0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn create_edit(class: &str, style: u32) -> HWND {
+    fn create_preview_test_owner() -> HWND {
         unsafe {
             CreateWindowExW(
                 0,
-                wide(class).as_ptr(),
-                wide("original").as_ptr(),
-                style,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
                 0,
                 0,
                 100,
@@ -1221,122 +1047,6 @@ mod tests {
                 null(),
             )
         }
-    }
-
-    fn edit_text(control: HWND) -> String {
-        let mut buffer = [0; 32];
-        let length = unsafe { GetWindowTextW(control, buffer.as_mut_ptr(), 32) };
-        String::from_utf16_lossy(&buffer[..length as usize])
-    }
-
-    #[test]
-    fn insertion_changes_only_the_addressed_edit_control() {
-        let style = WS_POPUP | ES_AUTOHSCROLL as u32;
-        let target = create_edit("Edit", style);
-        let other = create_edit("Edit", style);
-        let readonly = create_edit("Edit", style | ES_READONLY as u32);
-        let bounded = create_edit("Edit", WS_POPUP);
-        let controls = [target, other, readonly, bounded];
-        assert!(controls.iter().all(|control| !control.is_null()));
-        assert!(insert_text(target, "é界 "));
-        assert_eq!(edit_text(target), "é界 original");
-        assert_eq!(edit_text(other), "original");
-        assert!(!insert_text(readonly, "ignored"));
-        assert_eq!(edit_text(readonly), "original");
-        assert!(!insert_text(bounded, "ignored"));
-        assert_eq!(edit_text(bounded), "original");
-        for control in controls {
-            unsafe { DestroyWindow(control) };
-        }
-    }
-
-    #[test]
-    fn insertion_preserves_unicode_across_processes() {
-        check_cross_process_insertion("Edit");
-        check_cross_process_insertion("RICHEDIT50W");
-    }
-
-    fn check_cross_process_insertion(class: &str) {
-        use std::{fs, os::windows::process::CommandExt, process::Command, thread};
-        use windows_sys::Win32::{
-            System::{
-                LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW},
-                Threading::CREATE_NO_WINDOW,
-            },
-            UI::Controls::EM_SETSEL,
-        };
-
-        const HELPER_PATH: &str = "DFLOW_TEST_EDIT_CONTROL_DIRECTORY";
-        const HELPER_CLASS: &str = "DFLOW_TEST_EDIT_CONTROL_CLASS";
-        const CHECK_TEXT: u32 = WM_APP + 22;
-        const TRANSCRIPT: &str = "é界🙂 text ";
-        if let Some(path) = std::env::var_os(HELPER_PATH) {
-            if std::env::var(HELPER_CLASS).unwrap() != class {
-                return;
-            }
-            if class == "RICHEDIT50W" {
-                let library = unsafe {
-                    LoadLibraryExW(
-                        wide("msftedit.dll").as_ptr(),
-                        null_mut(),
-                        LOAD_LIBRARY_SEARCH_SYSTEM32,
-                    )
-                };
-                assert!(!library.is_null());
-            }
-            let control = create_edit(class, WS_POPUP | ES_AUTOHSCROLL as u32);
-            assert!(!control.is_null());
-            unsafe { SendMessageW(control, EM_SETSEL, 3, 3) };
-            let timer = unsafe { SetTimer(control, 1, 10_000, None) };
-            assert_ne!(timer, 0);
-            fs::write(
-                PathBuf::from(path).join("handle"),
-                (control as usize).to_string(),
-            )
-            .unwrap();
-            let mut msg = MSG::default();
-            while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
-                assert_ne!(msg.message, WM_TIMER, "parent did not signal completion");
-                if msg.hwnd == control && msg.message == CHECK_TEXT {
-                    assert_eq!(edit_text(control), format!("ori{TRANSCRIPT}ginal"));
-                    unsafe { DestroyWindow(control) };
-                    return;
-                }
-                unsafe { DispatchMessageW(&msg) };
-            }
-            panic!("edit control message loop ended early");
-        }
-
-        let root = tempfile::tempdir().unwrap();
-        let mut child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tray::tests::insertion_preserves_unicode_across_processes",
-            ])
-            .env(HELPER_PATH, root.path())
-            .env(HELPER_CLASS, class)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let handle_file = root.path().join("handle");
-        let control = loop {
-            if let Ok(handle) = fs::read_to_string(&handle_file)
-                && let Ok(handle) = handle.parse::<usize>()
-            {
-                break handle as HWND;
-            }
-            if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("edit control helper did not start");
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        let inserted = insert_text(control, TRANSCRIPT);
-        let signalled = unsafe { PostMessageW(control, CHECK_TEXT, 0, 0) } != 0;
-        assert!(child.wait().unwrap().success());
-        assert!(inserted && signalled);
     }
 
     #[test]
@@ -1359,15 +1069,15 @@ mod tests {
     }
 
     #[test]
-    fn preview_shortcut_paints_at_the_right_edge() {
+    fn preview_shortcut_paints_at_the_right_edge_and_accepts_clicks() {
         unsafe {
-            let parent = create_edit("Edit", WS_POPUP);
+            let parent = create_preview_test_owner();
             let shortcut = create_preview_shortcut(parent);
             assert!(!shortcut.is_null());
             assert_eq!(GetWindow(shortcut, GW_OWNER), parent);
             assert_eq!(GetWindowLongW(shortcut, GWL_STYLE) as u32 & WS_CHILD, 0);
             let width = 320;
-            SetWindowTextW(shortcut, wide("STOP · CTRL+SHIFT+/").as_ptr());
+            SetWindowTextW(shortcut, wide("STOP & COPY · CTRL+SHIFT+/").as_ptr());
             SetWindowPos(
                 shortcut,
                 null_mut(),
@@ -1386,6 +1096,40 @@ mod tests {
             let left = GetPixel(dc, 10, 8);
             let right_has_text = (0..SHORTCUT_HEIGHT)
                 .any(|y| ((width - 120)..(width - 9)).any(|x| GetPixel(dc, x, y) != background));
+            assert_eq!(
+                SendMessageW(shortcut, WM_MOUSEACTIVATE, 0, 0),
+                MA_NOACTIVATE as LRESULT
+            );
+            let mut message = MSG::default();
+            SendMessageW(shortcut, WM_LBUTTONDOWN, 0, 0);
+            SendMessageW(shortcut, WM_LBUTTONUP, 0, width as LPARAM);
+            assert_eq!(
+                PeekMessageW(
+                    &mut message,
+                    parent,
+                    PREVIEW_ACTION,
+                    PREVIEW_ACTION,
+                    PM_REMOVE
+                ),
+                0
+            );
+            for can_stop in [0, 1] {
+                SetWindowLongPtrW(shortcut, GWLP_USERDATA, can_stop);
+                SendMessageW(shortcut, WM_LBUTTONDOWN, 0, 0);
+                SendMessageW(shortcut, WM_LBUTTONUP, 0, 10);
+                assert_ne!(
+                    PeekMessageW(
+                        &mut message,
+                        parent,
+                        PREVIEW_ACTION,
+                        PREVIEW_ACTION,
+                        PM_REMOVE
+                    ),
+                    0
+                );
+                assert_eq!(message.wParam, can_stop as WPARAM);
+                assert_eq!(message.lParam, shortcut as LPARAM);
+            }
             SelectObject(dc, previous);
             DeleteObject(bitmap);
             DeleteDC(dc);
@@ -1408,30 +1152,19 @@ mod tests {
     }
 
     #[test]
-    fn copy_mode_aborts_early_then_previews_and_copies_the_final_revision() {
-        let (session, _send) = Session::test_channel();
+    fn dictation_aborts_early_and_copies_the_final_revision_once() {
+        let (session, send) = Session::test_channel();
         let now = Instant::now();
         let mut recording = Recording {
             session,
-            target: Some(Target {
-                window: 1usize as HWND,
-                control: 2usize as HWND,
-                changes: 0,
-            }),
-            copy_mode_since: None,
-            copy_ready: false,
+            started_at: now,
+            can_stop: false,
             listening: true,
             quiet: false,
             finishing: false,
             transcript: String::new(),
         };
-        assert_eq!(recording.status(), "Listening…");
-        recording.target = None;
-        recording.copy_mode_since = Some(now);
-        assert_eq!(
-            recording.status(),
-            "Listening… · Clipboard mode · Stop now to discard"
-        );
+        assert_eq!(recording.status(), "Listening… · Stop now to discard");
         recording.transcript = "Meet Wednesday.".into();
         assert!(recording.previewing());
         assert_eq!(recording.status(), "Meet Wednesday.");
@@ -1439,89 +1172,43 @@ mod tests {
             recording.preview_shortcut_label(Hotkey::default()),
             "CANCEL · CTRL+SHIFT+/"
         );
-        assert!(!recording.finish_requested(now + COPY_MODE_DELAY - Duration::from_millis(1)));
+        assert!(!recording.finish_requested(now + CANCEL_WINDOW - Duration::from_millis(1)));
         assert!(!recording.finishing);
         recording.transcript.clear();
-        assert!(recording.update_copy_mode(now + COPY_MODE_DELAY));
+        assert!(recording.update_cancel_window(now + CANCEL_WINDOW));
         assert_eq!(recording.status(), "Listening… · Waiting for transcript");
         recording.transcript = "Meet Wednesday.".into();
         assert_eq!(recording.status(), "Meet Wednesday.");
         assert_eq!(
             recording.preview_shortcut_label(Hotkey::default()),
-            "STOP · CTRL+SHIFT+/"
+            "STOP & COPY · CTRL+SHIFT+/"
         );
-        assert!(recording.finish_requested(now + COPY_MODE_DELAY));
-        recording.transcript = "Meet Tuesday.\nBring the notes.".into();
-        assert_eq!(recording.status(), "Meet Tuesday.\nBring the notes.");
-        let delivery = recording.finish(now + COPY_MODE_DELAY).unwrap();
-        assert!(delivery.action(None, true, now + COPY_MODE_DELAY) == DeliveryAction::Copy);
-        assert_eq!(delivery.text, "Meet Tuesday.\nBring the notes.");
-    }
+        assert!(recording.finish_requested(now + CANCEL_WINDOW));
 
-    #[test]
-    fn completed_recording_offers_latest_revision_and_only_once() {
-        let (session, send) = Session::test_channel();
-        send.send(Update::Transcript("We should meet Wednesday.".into()))
-            .unwrap();
-        send.send(Update::Transcript("We should meet Tuesday.".into()))
+        let final_transcript = "Meet Tuesday.\nBring the notes.";
+        send.send(Update::Transcript(final_transcript.into()))
             .unwrap();
         send.send(Update::Done).unwrap();
-        let target = Target {
-            window: 1usize as HWND,
-            control: 2usize as HWND,
-            changes: 0,
+        let (clipboard, writes, _feedback) = Clipboard::test_sink();
+        let mut app = App {
+            hwnd: null_mut(),
+            pill: null_mut(),
+            preview_shortcut: null_mut(),
+            pill_font: None,
+            icon: NOTIFYICONDATAW::default(),
+            path: PathBuf::new(),
+            binding: None,
+            recording: Some(recording),
+            last_transcript: None,
+            status_until: None,
+            clipboard,
+            copies_pending: 0,
+            timer: false,
         };
-        let mut recording = Some(Recording {
-            session,
-            target: Some(target),
-            copy_mode_since: None,
-            copy_ready: false,
-            listening: true,
-            quiet: false,
-            finishing: true,
-            transcript: String::new(),
-        });
-        let now = Instant::now();
-        let mut delivery = None;
-        while let Some(active) = recording.as_mut() {
-            match active.session.updates.try_recv().unwrap() {
-                Update::Transcript(text) => active.transcript = text,
-                Update::Done => delivery = recording.take().unwrap().finish(now),
-                _ => unreachable!(),
-            }
-        }
-        assert!(
-            delivery.as_ref().is_some_and(
-                |result| result.action(Some(target), true, now) == DeliveryAction::Wait
-            )
-        );
-        let result = delivery.take().unwrap();
-        assert_eq!(result.text, "We should meet Tuesday.");
-        assert!(result.action(Some(target), false, now) == DeliveryAction::Insert);
-        assert!(delivery.take().is_none());
-    }
-
-    #[test]
-    fn delivery_keeps_the_transcript_after_focus_change_or_for_multiline_text() {
-        let now = Instant::now();
-        let target = Target {
-            window: 1usize as HWND,
-            control: 2usize as HWND,
-            changes: 0,
-        };
-        let mut result = Delivery {
-            target: Some(target),
-            text: "Text".into(),
-            copy: false,
-            deadline: now,
-        };
-        let changed = Target {
-            changes: 1,
-            ..target
-        };
-        assert!(result.action(Some(changed), false, now) == DeliveryAction::Keep);
-        assert!(result.action(Some(target), true, now) == DeliveryAction::Keep);
-        result.text = "First line\nSecond line".into();
-        assert!(result.action(Some(target), false, now) == DeliveryAction::Keep);
+        app.tick();
+        assert_eq!(writes.try_recv().unwrap().text, final_transcript);
+        assert_eq!(app.last_transcript.as_deref(), Some(final_transcript));
+        app.tick();
+        assert!(matches!(writes.try_recv(), Err(TryRecvError::Empty)));
     }
 }

@@ -8,19 +8,19 @@ Use a global hotkey to dictate from the tray, or capture, edit, and save text in
 
 ## Install on Windows
 
-Download the Windows ZIP and extract it into a writable folder. Choose **DFlow Dictation** (`dflow-dictation.exe`) to dictate into other apps or **DFlow Scratchpad** (`dflow.exe`) to dictate into a saved note. Each executable is also available individually. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
+Download the Windows ZIP and extract it into a writable folder. Choose **DFlow Dictation** (`dflow-dictation.exe`) to dictate to the clipboard or **DFlow Scratchpad** (`dflow.exe`) to dictate into a saved note. Each executable is also available individually. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
 
 Already signed in to Codex CLI with ChatGPT on this PC? DFlow uses that login. To sign in for the first time or renew the session, run `codex login` and complete the browser sign-in with your ChatGPT account. [OpenAI's Codex sign-in guide](https://learn.chatgpt.com/docs/auth)
 
 When upgrading, close both apps before replacing the executables. Keep the `config` and `cache` folders to preserve your settings and saved note. If you used `dflow-tray.exe`, launch `dflow-dictation.exe` instead and re-enable **Start with Windows** in its Settings if you used that option.
 
-## Dictate into other apps
+## Dictate to the clipboard
 
 1. Launch `dflow-dictation.exe`. DFlow Dictation runs in the Windows notification area.
-2. Place the caret where you want the text. Press **Ctrl+Shift+/** to start dictation, then press it again to finish. The default shortcut uses the slash/question-mark key on a US keyboard.
-3. DFlow inserts single-line text at the original caret in a supported field, including Windows Notepad. If the field is missing, unsupported, or loses focus, DFlow switches to Clipboard mode. The live preview appears as soon as words are ready and grows to fit up to three lines. The shortcut above it says **Cancel** for the first two seconds and **Stop** once the recording is long enough to copy. Use **Cancel recording** in the tray menu to discard it at any time.
+2. Press **Ctrl+Shift+/** to start dictation. The default shortcut uses the slash/question-mark key on a US keyboard. The live preview appears as soon as words are ready and grows to fit up to three lines.
+3. Press the shortcut again within two seconds to discard the recording. After two seconds, press it to stop and copy the full transcript when it’s ready. You can also click **Cancel** or **Stop & Copy** above the live preview. Use **Cancel recording** in the tray menu to discard at any time.
 
-Open **Settings** from the tray icon to change the shortcut or enable **Start with Windows**. **Copy last transcript** retrieves the latest result from the current session, including multiline results that could not be inserted.
+Open **Settings** from the tray icon to change the shortcut or enable **Start with Windows**. **Copy last transcript** retrieves the latest result from the current session.
 
 ## Capture and edit in the scratchpad
 
@@ -78,4 +78,4 @@ With Rust and Cargo installed on Windows, run this from the repository root.
 cargo build --release --locked --bins
 ```
 
-Launch `target\release\dflow-dictation.exe` for dictation into other apps or run `.\target\release\dflow.exe` in Windows Terminal for the scratchpad.
+Launch `target\release\dflow-dictation.exe` to dictate to the clipboard or run `.\target\release\dflow.exe` in Windows Terminal for the scratchpad.
