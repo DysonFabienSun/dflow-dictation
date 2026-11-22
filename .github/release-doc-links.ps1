@@ -10,8 +10,9 @@ $root = Split-Path -Parent $PSScriptRoot
 $readme = Get-Content -LiteralPath (Join-Path $root 'README.zh-CN.md') -Raw -Encoding utf8 -ErrorAction Stop
 $changelog = Get-Content -LiteralPath (Join-Path $root 'CHANGELOG.zh-CN.md') -Raw -Encoding utf8 -ErrorAction Stop
 $install = '安装或升级'
-if ($readme -cnotmatch "(?m)^## $install\r?$") {
-    throw "README.zh-CN.md must contain the '## $install' heading."
+$installHeading = [regex]::Match($readme, '(?m)^## (安装或升级|安装与升级（Windows）)\r?$')
+if (-not $installHeading.Success) {
+    throw "README.zh-CN.md must contain the '## $install' or '## 安装与升级（Windows）' heading."
 }
 
 $anchor = "release-$Tag"
@@ -26,6 +27,7 @@ if ($entries.Count -ne 1 -or $anchors.Count -ne 1 -or $entries[0].Groups['notes'
 
 if ($SourceUrl) {
     $source = $SourceUrl.TrimEnd('/')
-    $installAnchor = [uri]::EscapeDataString($install)
+    $headingSlug = ($installHeading.Groups[1].Value -replace '[（）]', '').ToLowerInvariant()
+    $installAnchor = [uri]::EscapeDataString($headingSlug)
     "[更新日志]($source/CHANGELOG.zh-CN.md#$anchor) · [$install]($source/README.zh-CN.md#$installAnchor)"
 }
