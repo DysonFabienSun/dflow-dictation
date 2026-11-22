@@ -16,6 +16,7 @@ const SECONDARY: Style = Style::new().fg(Color::DarkGray);
 const ACCENT: Style = Style::new().fg(Color::Cyan);
 const SELECTED: Style = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
 const NOTE_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
+const NOTE_UNDERLINE: Style = Style::new().add_modifier(Modifier::UNDERLINED);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let screen = frame.area();
@@ -138,14 +139,23 @@ fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
             .map(|row| Line::raw(row.text.as_str()))
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
-        if let Some(selection) = app.editor.selection() {
+        let highlight = app
+            .editor
+            .selection()
+            .map(|range| (range, NOTE_SELECTION))
+            .or_else(|| app.editor.underline().map(|range| (range, NOTE_UNDERLINE)));
+        if let Some((range, style)) = highlight {
             for (index, row) in visible.iter().enumerate() {
-                let columns = row.selected_columns(&selection);
+                let columns = if style == NOTE_SELECTION {
+                    row.selected_columns(&range)
+                } else {
+                    row.underlined_columns(&range)
+                };
                 let start = columns.start.min(usize::from(area.width)) as u16;
                 let end = columns.end.min(usize::from(area.width)) as u16;
                 frame.buffer_mut().set_style(
                     Rect::new(area.x + start, area.y + index as u16, end - start, 1),
-                    NOTE_SELECTION,
+                    style,
                 );
             }
         }

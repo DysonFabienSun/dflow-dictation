@@ -1,20 +1,25 @@
 mod agent;
 mod app;
 mod cache;
+#[cfg(windows)]
+mod terminal_input;
 mod ui;
 
 use dflow_scratchpad::{audio, clipboard, codex, config, editor, transcript};
 
 use crossterm::{
     cursor::Show,
-    event::{self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
+    event::{
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture,
+    },
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{
     env,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     path::Path,
     time::Duration,
 };
@@ -48,7 +53,8 @@ impl Drop for InputMode {
 
 struct Screen {
     #[cfg(windows)]
-    _input_mode: InputMode,
+    input_mode: InputMode,
+    bracketed_paste: bool,
 }
 
 impl Screen {
@@ -56,18 +62,37 @@ impl Screen {
         #[cfg(windows)]
         let input_mode = InputMode::capture()?;
         terminal::enable_raw_mode()?;
-        let guard = Self {
+        let mut guard = Self {
             #[cfg(windows)]
-            _input_mode: input_mode,
+            input_mode,
+            bracketed_paste: false,
         };
         execute!(io::stdout(), EnterAlternateScreen, EnableFocusChange)?;
         execute!(io::stdout(), EnableMouseCapture)?;
+        #[cfg(windows)]
+        if env::var_os("WT_SESSION").is_some() {
+            terminal_input::enable_vt_input(guard.input_mode.handle)?;
+            guard.bracketed_paste = true;
+            let mut out = io::stdout().lock();
+            // ConPTY normally requests Win32 keyboard reporting. Keep it active
+            // in VT input mode so the terminal supplies physical key releases.
+            out.write_all(b"\x1b[?9001h")?;
+            execute!(out, EnableBracketedPaste)?;
+        }
+        #[cfg(not(windows))]
+        {
+            guard.bracketed_paste = true;
+            execute!(io::stdout(), EnableBracketedPaste)?;
+        }
         Ok(guard)
     }
 }
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        if self.bracketed_paste {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+        }
         let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen, Show);
         #[cfg(not(windows))]
@@ -108,7 +133,11 @@ fn run_terminal(
     mut cache: Option<&mut cache::NoteCache>,
     agent_access: bool,
 ) -> io::Result<()> {
-    let _screen = Screen::enter()?;
+    let screen = Screen::enter()?;
+    #[cfg(windows)]
+    let mut input = screen
+        .bracketed_paste
+        .then(|| terminal_input::TerminalInput::new(screen.input_mode.handle));
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let window = if agent_access {
         match agent::Window::start() {
@@ -144,12 +173,27 @@ fn run_terminal(
             terminal.draw(|frame| ui::draw(frame, app))?;
             redraw = false;
         }
-        if event::poll(Duration::from_millis(20))? {
-            app.event(event::read()?);
+        let timeout = Duration::from_millis(20);
+        #[cfg(windows)]
+        let event = match &mut input {
+            Some(input) => input.read(timeout)?,
+            None => read_event(timeout)?,
+        };
+        #[cfg(not(windows))]
+        let event = read_event(timeout)?;
+        if let Some(event) = event {
+            app.event(event);
             redraw = true;
         }
     }
     Ok(())
+}
+
+fn read_event(timeout: Duration) -> io::Result<Option<event::Event>> {
+    if event::poll(timeout)? {
+        return event::read().map(Some);
+    }
+    Ok(None)
 }
 
 fn main() -> std::process::ExitCode {

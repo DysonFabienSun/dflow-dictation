@@ -17,6 +17,11 @@ pub struct NoteRow {
 }
 
 impl NoteRow {
+    pub fn underlined_columns(&self, range: &Range<usize>) -> Range<usize> {
+        let columns = self.selected_columns(range);
+        columns.start.min(self.text_width)..columns.end.min(self.text_width)
+    }
+
     pub fn selected_columns(&self, selection: &Range<usize>) -> Range<usize> {
         let column = |offset| {
             let index = self.carets.partition_point(|&(caret, _)| caret < offset);
@@ -127,10 +132,16 @@ struct Note {
     cursor: usize,
 }
 
+struct Underline {
+    range: Range<usize>,
+    slash_pending: bool,
+}
+
 #[derive(Default)]
 pub struct Editor {
     note: Note,
     anchor: Option<usize>,
+    underline: Option<Underline>,
     undo: Vec<Note>,
     redo: Vec<Note>,
     group: Option<Note>,
@@ -181,14 +192,40 @@ impl Editor {
         (anchor != cursor).then(|| anchor.min(cursor)..anchor.max(cursor))
     }
 
+    pub fn underline(&self) -> Option<Range<usize>> {
+        self.underline
+            .as_ref()
+            .map(|underline| underline.range.clone())
+    }
+
+    fn set_underline(&mut self, range: Range<usize>) {
+        self.underline = (!range.is_empty()).then_some(Underline {
+            range,
+            slash_pending: true,
+        });
+    }
+
+    pub fn take_underline_slash(&mut self) -> bool {
+        self.underline
+            .as_mut()
+            .is_some_and(|underline| std::mem::take(&mut underline.slash_pending))
+    }
+
     pub fn select_all(&mut self) {
         self.end_burst();
         self.anchor = Some(0);
         self.note.cursor = self.text().len();
+        self.clear_underline_for_selection();
     }
 
     pub fn clear_selection(&mut self) {
         self.anchor = None;
+    }
+
+    fn clear_underline_for_selection(&mut self) {
+        if self.selection().is_some() {
+            self.underline = None;
+        }
     }
 
     pub fn point_caret(&mut self, row: usize, column: usize, width: usize, extend: bool) {
@@ -212,6 +249,7 @@ impl Editor {
             }),
             None => self.text().len(),
         };
+        self.clear_underline_for_selection();
     }
 
     pub fn move_caret(&mut self, movement: Movement, extend: bool, width: usize) {
@@ -262,6 +300,7 @@ impl Editor {
             Movement::NoteStart => self.note.cursor = 0,
             Movement::NoteEnd => self.note.cursor = self.text().len(),
         }
+        self.clear_underline_for_selection();
     }
 
     pub fn edit(&mut self, change: impl FnOnce(&mut Self) -> bool) -> bool {
@@ -318,6 +357,7 @@ impl Editor {
         if let Some(previous) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.note, previous));
             self.clear_selection();
+            self.underline = None;
             return true;
         }
         false
@@ -328,6 +368,7 @@ impl Editor {
         if let Some(next) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.note, next));
             self.clear_selection();
+            self.underline = None;
             return true;
         }
         false
@@ -340,19 +381,67 @@ impl Editor {
         self.begin();
         self.note = Note::default();
         self.clear_selection();
+        self.underline = None;
         self.finish();
         true
     }
 
     pub fn lowercase(&mut self) -> bool {
-        let lower = self.text().to_lowercase();
-        if lower == self.text() {
+        let Some(target) = self.selection().or_else(|| self.underline()) else {
+            return false;
+        };
+        let text = self.text();
+        let cursor = self.cursor();
+        let inside = cursor.clamp(target.start, target.end);
+        let mut lower = String::new();
+        let mut new_inside = 0;
+        let mut start = target.start;
+        let mut push = |range: Range<usize>, preserve: bool| {
+            let part = &text[range.clone()];
+            let prefix = &text[range.start..inside.clamp(range.start, range.end)];
+            if preserve {
+                lower.push_str(part);
+                new_inside += prefix.len();
+            } else {
+                lower.push_str(&part.to_lowercase());
+                new_inside += prefix.to_lowercase().len();
+            }
+        };
+        for (offset, word) in text.unicode_word_indices() {
+            let end = offset + word.len();
+            if end <= start {
+                continue;
+            }
+            if offset >= target.end {
+                break;
+            }
+            let mut previous_uppercase = false;
+            let preserve = word.graphemes(true).any(|grapheme| {
+                let upper = grapheme.starts_with(char::is_uppercase);
+                std::mem::replace(&mut previous_uppercase, upper) && upper
+            });
+            if preserve {
+                let protected_start = offset.max(start);
+                let protected_end = end.min(target.end);
+                push(start..protected_start, false);
+                push(protected_start..protected_end, true);
+                start = protected_end;
+            }
+        }
+        push(start..target.end, false);
+        if lower == text[target.clone()] {
             return false;
         }
+        let new_cursor = if cursor >= target.start {
+            target.start + new_inside + cursor.saturating_sub(target.end)
+        } else {
+            cursor
+        };
         self.begin();
-        self.note.cursor = self.text()[..self.cursor()].to_lowercase().len();
-        self.note.text = lower;
+        self.note.text.replace_range(target, &lower);
+        self.note.cursor = new_cursor;
         self.clear_selection();
+        self.underline = None;
         self.align_cursor();
         self.finish();
         true
@@ -361,6 +450,24 @@ impl Editor {
     pub fn insert(&mut self, text: &str) -> bool {
         let range = self.selection().unwrap_or(self.cursor()..self.cursor());
         self.insert_in_range(range, text)
+    }
+
+    pub fn insert_incoming(&mut self, text: &str) -> bool {
+        let range = self.selection().unwrap_or(self.cursor()..self.cursor());
+        self.insert_underlined(range, text)
+    }
+
+    pub fn insert_incoming_at(&mut self, offset: usize, text: &str) -> bool {
+        self.insert_underlined(offset..offset, text)
+    }
+
+    fn insert_underlined(&mut self, range: Range<usize>, text: &str) -> bool {
+        let start = range.start;
+        let changed = self.insert_in_range(range, text);
+        if changed {
+            self.set_underline(start..start + text.len());
+        }
+        changed
     }
 
     pub fn insert_at(&mut self, offset: usize, text: &str) -> bool {
@@ -376,6 +483,7 @@ impl Editor {
         self.note.cursor = range.start + text.len();
         if changed {
             self.note.text.replace_range(range, text);
+            self.underline = None;
         }
         self.align_cursor();
         changed
@@ -392,6 +500,7 @@ impl Editor {
         self.note.cursor = text.len();
         self.note.text = text;
         self.clear_selection();
+        self.set_underline(0..self.cursor());
         true
     }
 
@@ -413,6 +522,7 @@ impl Editor {
         }
         self.note.text.replace_range(range.clone(), &insertion);
         range.end = range.start + insertion.len();
+        self.set_underline(range.clone());
         self.note.cursor = range.start + advance;
         self.align_cursor();
         true
@@ -504,6 +614,7 @@ impl Editor {
         }
         self.note.cursor = range.start;
         self.note.text.replace_range(range, "");
+        self.underline = None;
         self.align_cursor();
         true
     }
@@ -512,6 +623,45 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lowercase_preserves_acronyms_and_maps_unicode_caret() {
+        let mut editor = Editor::from_note("Before After".into(), 7);
+        let incoming = "İtem NASA OpenAI APIs ";
+        assert!(editor.edit(|editor| editor.insert_incoming(incoming)));
+        editor.move_caret(Movement::Right, false, 80);
+        assert_eq!(editor.underline(), Some(7..7 + incoming.len()));
+        assert!(editor.lowercase());
+        assert_eq!(editor.text(), "Before i\u{307}tem NASA OpenAI APIs After");
+        assert_eq!(&editor.text()[editor.cursor()..], "fter");
+        assert_eq!(editor.underline(), None);
+        assert!(editor.undo());
+        assert_eq!(editor.text(), format!("Before {incoming}After"));
+        assert!(!editor.lowercase());
+        assert!(editor.redo());
+        assert_eq!(editor.underline(), None);
+    }
+
+    #[test]
+    fn selection_replaces_underline_and_protects_partially_selected_words() {
+        let mut editor = Editor::from_note("OpenAI Before ".into(), 14);
+        assert!(editor.edit(|editor| editor.insert_incoming("Incoming")));
+        editor.move_caret(Movement::WordLeft, false, 80);
+        editor.move_caret(Movement::WordLeft, true, 80);
+        editor.move_caret(Movement::WordLeft, true, 80);
+        editor.move_caret(Movement::Right, true, 80);
+        assert_eq!(editor.selection(), Some(1..14));
+        assert_eq!(editor.underline(), None);
+        assert!(editor.lowercase());
+        assert_eq!(editor.text(), "OpenAI before Incoming");
+
+        assert!(editor.edit(|editor| editor.insert_incoming_at(0, "Another ")));
+        assert!(
+            editor.edit_burst(BurstKind::Typing, Instant::now(), |editor| editor
+                .insert("x"))
+        );
+        assert_eq!(editor.underline(), None);
+    }
 
     #[test]
     fn typing_bursts_split_after_a_pause_or_a_caret_move() {

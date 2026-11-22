@@ -85,6 +85,11 @@ impl CommandQuery {
 
 impl Menu {
     pub fn visible(&self) -> Vec<&Row> {
+        let limit = if self.query.is_some() {
+            5
+        } else {
+            self.rows.len()
+        };
         self.rows
             .iter()
             .filter(|row| {
@@ -93,6 +98,7 @@ impl Menu {
                     row.name.trim_start_matches('/').starts_with(text)
                 })
             })
+            .take(limit)
             .collect()
     }
 
@@ -419,7 +425,7 @@ impl App {
                         input.push_str(&text);
                     }
                 } else if self.panes.is_empty() {
-                    let changed = self.editor.edit(|editor| editor.insert(&text));
+                    let changed = self.editor.edit(|editor| editor.insert_incoming(&text));
                     self.note_changed(changed);
                 }
             }
@@ -569,6 +575,12 @@ impl App {
             KeyCode::Esc => {
                 self.editor.end_burst();
                 self.panes.push(Pane::Menu(commands(false)));
+                return;
+            }
+            KeyCode::Char('/')
+                if key.kind == KeyEventKind::Press && self.editor.take_underline_slash() =>
+            {
+                self.control_key(key);
                 return;
             }
             KeyCode::Backspace => {
@@ -738,12 +750,14 @@ impl App {
                     check(revision, self.revision)?;
                     let text = clean_text(&text);
                     changed = match operation {
-                        Edit::Append => self.editor.edit(|editor| editor.append(&text)),
+                        Edit::Append => self
+                            .editor
+                            .edit(|editor| editor.insert_incoming_at(editor.text().len(), &text)),
                         Edit::Insert => self.editor.edit(|editor| {
                             if !text.is_empty() {
                                 editor.clear_selection();
                             }
-                            editor.insert(&text)
+                            editor.insert_incoming(&text)
                         }),
                         Edit::InsertAfterLine { line } => self.insert_after_line(&line, text)?,
                         Edit::Replace => self.editor.edit(|editor| editor.replace(text)),
@@ -800,7 +814,9 @@ impl App {
         } else {
             text.insert(0, '\n');
         }
-        Ok(self.editor.edit(|editor| editor.insert_at(offset, &text)))
+        Ok(self
+            .editor
+            .edit(|editor| editor.insert_incoming_at(offset, &text)))
     }
 
     fn perform(&mut self, action: Action) {
@@ -1142,7 +1158,11 @@ fn commands(slash_prompt: bool) -> Menu {
         selected: 0,
         rows: vec![
             Row::new("/clear", "Clear the note", Action::Clear),
-            Row::new("/lowercase", "Lowercase the note", Action::Lowercase),
+            Row::new(
+                "/lowercase",
+                "Selection or underline · keep abbreviations",
+                Action::Lowercase,
+            ),
             Row::new(
                 "/settings",
                 "View device, provider, and proxy settings",
@@ -1362,6 +1382,13 @@ mod tests {
                 panic!("expected command menu");
             };
             assert_eq!(menu.query.as_ref().unwrap().display(), prefix);
+            assert_eq!(
+                menu.visible()
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["/clear", "/lowercase", "/settings", "/device", "/provider"]
+            );
             app.key(key(KeyCode::Char('c')));
             app.key(esc);
             assert!(app.panes.is_empty());
@@ -1375,10 +1402,16 @@ mod tests {
             app.key(enter);
         };
         app.key(key(KeyCode::Char('A')));
-        run(&mut app, esc, "lowercase");
-        assert_eq!(app.editor.text(), "a");
-        run(&mut app, slash, ":u");
+        run(&mut app, esc, "/lower");
         assert_eq!(app.editor.text(), "A");
+        assert!(app.panes.is_empty());
+        for (entry, command) in [(esc, "lowercase"), (esc, "/lower"), (slash, "lower")] {
+            app.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+            run(&mut app, entry, command);
+            assert_eq!(app.editor.text(), "a");
+            run(&mut app, slash, ":u");
+            assert_eq!(app.editor.text(), "A");
+        }
         run(&mut app, esc, ":h");
         assert!(matches!(app.panes.as_slice(), [Pane::Help]));
         app.key(esc);
@@ -1400,6 +1433,44 @@ mod tests {
     }
 
     #[test]
+    fn first_slash_after_each_underline_opens_commands_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        let slash = key(KeyCode::Char('/'));
+        let esc = key(KeyCode::Esc);
+
+        app.key(slash);
+        assert_eq!(app.editor.text(), "/");
+        app.event(Event::Paste("First".into()));
+        app.key(slash);
+        let [Pane::Menu(menu)] = app.panes.as_slice() else {
+            panic!("expected the slash command menu");
+        };
+        assert_eq!(menu.query.as_ref().unwrap().display(), "/");
+        assert_eq!(app.editor.text(), "/First");
+        assert_eq!(app.editor.underline(), Some(1..6));
+        app.key(esc);
+        app.key(slash);
+        assert!(app.panes.is_empty());
+        assert_eq!(app.editor.text(), "/First/");
+
+        app.event(Event::Paste("Second".into()));
+        app.key(slash);
+        for c in "lower".chars() {
+            app.key(key(KeyCode::Char(c)));
+        }
+        app.key(key(KeyCode::Enter));
+        assert_eq!(app.editor.text(), "/First/second");
+
+        app.event(Event::Paste("Third".into()));
+        app.key(key(KeyCode::Char('!')));
+        app.key(slash);
+        assert!(app.panes.is_empty());
+        assert_eq!(app.editor.text(), "/First/secondThird!/");
+    }
+
+    #[test]
     fn keyboard_history_keeps_replacements_newlines_and_pastes_separate() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
@@ -1412,6 +1483,8 @@ mod tests {
         }
         app.key(key(KeyCode::Enter));
         app.event(Event::Paste("pasted".into()));
+        let range = app.editor.underline().unwrap();
+        assert_eq!(&app.editor.text()[range], "pasted");
         app.key(key(KeyCode::Char('!')));
         assert_eq!(app.editor.text(), "new\npasted!");
 
@@ -1486,6 +1559,8 @@ mod tests {
             assert!(changed);
             assert_eq!(app.editor.text(), after);
             assert_eq!(app.revision(), 1);
+            let range = app.editor.underline().unwrap();
+            assert_eq!(app.editor.text()[range].trim(), "First\nSecond");
 
             let (result, changed) = app.agent_command(insert());
             assert_eq!(
@@ -1499,6 +1574,30 @@ mod tests {
             assert_eq!(app.editor.text(), before);
             assert_eq!(app.editor.cursor(), 0);
         }
+    }
+
+    #[test]
+    fn agent_replacement_underlines_the_new_note_for_lowercase() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+        app.editor = Editor::from_note("Old Text".into(), 0);
+        let replacement = "New NASA Text";
+        let (result, changed) = app.agent_command(Command::Edit {
+            operation: crate::agent::Edit::Replace,
+            text: replacement.into(),
+            revision: Some(0),
+        });
+        assert!(result.is_ok());
+        assert!(changed);
+        assert_eq!(app.editor.underline(), Some(0..replacement.len()));
+        app.perform(Action::Lowercase);
+        assert_eq!(app.editor.text(), "new NASA text");
+        assert_eq!(app.editor.underline(), None);
+        app.perform(Action::Undo);
+        assert_eq!(app.editor.text(), replacement);
+        assert_eq!(app.editor.underline(), None);
+        app.perform(Action::Undo);
+        assert_eq!(app.editor.text(), "Old Text");
     }
 
     #[test]
@@ -1555,6 +1654,10 @@ mod tests {
             send.send(Update::Transcript(text.into())).unwrap();
             assert!(app.tick());
             assert_eq!(app.editor.text(), format!("Note: {text}"));
+            assert_eq!(
+                &app.editor.text()[app.editor.underline().unwrap()],
+                format!(" {text}")
+            );
             assert!(notes.try_recv().is_err());
         }
 
@@ -1567,6 +1670,7 @@ mod tests {
 
         app.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
         assert_eq!(app.editor.text(), "Note:");
+        assert_eq!(app.editor.underline(), None);
         assert!(notes.try_recv().is_err());
     }
 

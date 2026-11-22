@@ -28,7 +28,9 @@ Paste the transcript into any app with **Ctrl+V**. In **Settings**, you can chan
 
 Run `.\dflow.exe` in PowerShell 7 under Windows Terminal. It works like Notepad and saves your note as you edit. Tap **Ctrl+Space** to start or stop dictation.
 
-Press **Esc** or **Ctrl+/** to open commands. Use `/help` for shortcuts, `/clear` to clear the note, or `/lower` (short for `/lowercase`) to lowercase it.
+Press **Esc** or **Ctrl+/** to open commands. Use `/help` for shortcuts or `/clear` to clear the note.
+
+DFlow underlines the latest dictation, paste, or text supplied by an agent. The first **/** you type while a new underline is active opens commands like **Ctrl+/**. Use `/lower` (short for `/lowercase`) on that text or select text yourself to lower it instead. Selecting text or changing the note clears the previous underline. Words with consecutive uppercase letters, such as NASA and OpenAI, keep their original case.
 
 ## Settings
 
