@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文** · [更新日志](https://github.com/DysonFabienSun/dflow-dictation/releases)
 
-&lt;img src=&quot;assets/dflow.svg&quot; alt=&quot;DFlow 图标&quot; width=&quot;72&quot;&gt;
+<img src="assets/dflow.svg" alt="DFlow 图标" width="72">
 
 **Windows 下的 ChatGPT 语音听写工具，直接用你手头现有的订阅。** DFlow 会复用你在 Codex CLI 里登录好的 ChatGPT 账号（Plus、Pro 等订阅均支持），不用单独给 DFlow 买订阅，也不用折腾 OpenAI API Key。
 
