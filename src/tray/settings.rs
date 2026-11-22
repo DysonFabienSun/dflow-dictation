@@ -1,8 +1,9 @@
 use super::tray::{Binding, instance, message, wide};
 use dflow_scratchpad::{
     audio,
-    config::{Config, parse_proxy_url},
+    config::{Config, SaveError, parse_proxy_url},
     hotkey::Hotkey,
+    locale::{Language, Locale},
 };
 use std::{
     io,
@@ -23,6 +24,12 @@ const PROXY_ON: i32 = 104;
 const PROXY_URL: i32 = 105;
 const STARTUP: i32 = 106;
 const LAUNCH_PREVIEW: i32 = 107;
+const LANGUAGE: i32 = 108;
+const HOTKEY_LABEL: i32 = 201;
+const DEVICE_LABEL: i32 = 202;
+const AUTH_LABEL: i32 = 203;
+const LANGUAGE_LABEL: i32 = 204;
+const RESTART_HINT: i32 = 205;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "DFlow Tray";
 
@@ -36,18 +43,18 @@ struct Dialog {
     scan: mpsc::Receiver<Result<Vec<audio::InputDevice>, String>>,
 }
 
-pub fn open(owner: HWND, path: &Path, binding: &mut Option<Binding>) {
+pub fn open(owner: HWND, path: &Path, binding: &mut Option<Binding>, locale: Locale) {
     let result = (|| {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         let command = format!("\"{}\"", exe.display());
         let startup = read_startup().map_err(|error| error.to_string())?;
         let (send, scan) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = send.send(audio::devices());
+            let _ = send.send(audio::devices(locale));
         });
         let mut dialog = Dialog {
             owner,
-            config: Config::load(path.to_path_buf()),
+            config: Config::load_for(path.to_path_buf(), Some(locale)),
             binding: *binding,
             command,
             startup,
@@ -70,7 +77,8 @@ pub fn open(owner: HWND, path: &Path, binding: &mut Option<Binding>) {
         Ok(())
     })();
     if let Err(error) = result {
-        message(owner, &format!("Could not open settings. {error}"));
+        let hint = locale.text("Could not open settings.", "无法打开设置");
+        message(owner, &format!("{hint} {error}"), locale);
     }
 }
 
@@ -101,7 +109,11 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     unsafe {
                         KillTimer(hwnd, 1);
                     }
-                    state.set_devices(hwnd, Err("Microphone scan ended unexpectedly.".into()));
+                    let error = state
+                        .config
+                        .locale
+                        .text("Microphone scan ended unexpectedly.", "麦克风搜索意外中断");
+                    state.set_devices(hwnd, Err(error.into()));
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -109,12 +121,13 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         }
         WM_COMMAND => match (wp & 0xffff) as i32 {
             IDOK => {
-                let result = unsafe { &mut *state }.save(hwnd);
+                let state = unsafe { &mut *state };
+                let result = state.save(hwnd);
                 match result {
                     Ok(()) => unsafe {
                         EndDialog(hwnd, 1);
                     },
-                    Err(error) => message(hwnd, &error),
+                    Err(error) => message(hwnd, &error, state.config.locale),
                 }
                 1
             }
@@ -132,6 +145,40 @@ unsafe extern "system" fn dialog_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 
 impl Dialog {
     fn populate(&mut self, hwnd: HWND) {
+        let locale = self.config.locale;
+        let title = format!(
+            "{}{}",
+            locale.dictation_name(),
+            locale.text(" Settings", "设置")
+        );
+        unsafe { SetWindowTextW(hwnd, wide(&title).as_ptr()) };
+        for (id, name) in [
+            (
+                HOTKEY_LABEL,
+                locale.text("Dictation shortcut", "听写快捷键"),
+            ),
+            (DEVICE_LABEL, locale.text("Microphone", "麦克风")),
+            (AUTH_LABEL, locale.text("Codex auth file", "Codex 登录文件")),
+            (PROXY_ON, locale.text("Use network proxy", "使用网络代理")),
+            (STARTUP, locale.text("Start with Windows", "开机自启动")),
+            (LAUNCH_PREVIEW, locale.text("Show startup tip", "启动提示")),
+            (
+                LANGUAGE_LABEL,
+                locale.text("Interface language", "界面语言"),
+            ),
+            (RESTART_HINT, locale.language_changed()),
+            (IDOK, locale.text("Save", "保存")),
+            (IDCANCEL, locale.text("Cancel", "取消")),
+        ] {
+            set(hwnd, id, name);
+        }
+        for (index, language) in Language::OPTIONS.into_iter().enumerate() {
+            add_combo_item(hwnd, LANGUAGE, language.label(locale));
+            if language == self.config.settings.language {
+                unsafe { SendDlgItemMessageW(hwnd, LANGUAGE, CB_SETCURSEL, index, 0) };
+            }
+        }
+
         let binding = self
             .config
             .tray_hotkey()
@@ -164,7 +211,8 @@ impl Dialog {
             .selected_device(hwnd)
             .unwrap_or(&self.config.settings.device)
             .clone();
-        let mut items = vec![(None, "System default".to_owned())];
+        let locale = self.config.locale;
+        let mut items = vec![(None, locale.text("System default", "系统默认").to_owned())];
         if let Ok(devices) = devices {
             items.extend(
                 devices
@@ -178,7 +226,9 @@ impl Dialog {
         {
             items.push((
                 Some(id.clone()),
-                "Saved microphone (unavailable)".to_owned(),
+                locale
+                    .text("Saved microphone (unavailable)", "所选麦克风不可用")
+                    .to_owned(),
             ));
         }
         unsafe {
@@ -186,15 +236,7 @@ impl Dialog {
         }
         self.devices.clear();
         for (id, label) in items {
-            unsafe {
-                SendDlgItemMessageW(
-                    hwnd,
-                    DEVICE,
-                    CB_ADDSTRING,
-                    0,
-                    wide(&label).as_ptr() as LPARAM,
-                );
-            }
+            add_combo_item(hwnd, DEVICE, &label);
             self.devices.push(id);
         }
         let index = self
@@ -213,8 +255,13 @@ impl Dialog {
     }
 
     fn save(&mut self, hwnd: HWND) -> Result<(), String> {
-        let hotkey: Hotkey = get(hwnd, HOTKEY).parse()?;
+        let locale = self.config.locale;
+        let hotkey = Hotkey::parse_localized(&get(hwnd, HOTKEY), locale)?;
         let mut settings = self.config.settings.clone();
+        let index = unsafe { SendDlgItemMessageW(hwnd, LANGUAGE, CB_GETCURSEL, 0, 0) };
+        if let Some(&language) = Language::OPTIONS.get(index as usize) {
+            settings.language = language;
+        }
         if let Some(device) = self.selected_device(hwnd) {
             settings.device = device.clone();
         }
@@ -225,9 +272,9 @@ impl Dialog {
             .as_ref()
             .is_some_and(|path| !path.is_absolute())
         {
-            return Err("Enter an absolute Codex auth-file path, or leave it blank for automatic discovery.".into());
+            return Err(locale.text("Enter an absolute Codex auth-file path, or leave it blank for automatic discovery.", "请输入 Codex 登录文件的绝对路径，留空则自动查找").into());
         }
-        settings.proxy.url = parse_proxy_url(get(hwnd, PROXY_URL).trim())?;
+        settings.proxy.url = parse_proxy_url(get(hwnd, PROXY_URL).trim(), locale)?;
         settings.proxy.enabled = checked(hwnd, PROXY_ON);
 
         let previous = self.binding;
@@ -239,7 +286,7 @@ impl Dialog {
             } else {
                 1
             };
-            Some(Binding::register(self.owner, hotkey, id)?)
+            Some(Binding::register(self.owner, hotkey, id, locale)?)
         };
         let result = self.save_changes(
             settings,
@@ -273,6 +320,7 @@ impl Dialog {
         startup: bool,
         show_launch_preview: bool,
     ) -> Result<(), String> {
+        let locale = self.config.locale;
         let desired = if startup {
             Some(self.command.as_str())
         } else {
@@ -282,21 +330,32 @@ impl Dialog {
         };
         let changed = desired != self.startup.as_deref();
         if changed {
-            write_startup(desired)
-                .map_err(|error| format!("Could not change Start with Windows. {error}"))?;
+            write_startup(desired).map_err(|error| {
+                let hint = locale.text(
+                    "Could not change Start with Windows.",
+                    "无法修改开机自启动设置",
+                );
+                format!("{hint} {error}")
+            })?;
         }
         if let Err(error) = self.config.save_tray(settings, hotkey, show_launch_preview) {
+            let message = match error {
+                SaveError::ChangedOnDisk => locale
+                    .text(
+                        "Settings changed on disk. Close and reopen this dialog before saving.",
+                        "设置已被修改，请关闭并重新打开此窗口后再保存",
+                    )
+                    .into(),
+                SaveError::Message(message) => message,
+            };
             if changed && let Err(restore) = write_startup(self.startup.as_deref()) {
-                return Err(format!(
-                    "{error}\nCould not restore Start with Windows. {restore}"
-                ));
-            }
-            if error.contains("changed on disk") {
-                return Err(
-                    "Settings changed on disk. Close and reopen this dialog before saving.".into(),
+                let hint = locale.text(
+                    "Could not restore Start with Windows.",
+                    "无法恢复开机自启动设置",
                 );
+                return Err(format!("{message}\n{hint} {restore}"));
             }
-            return Err(error);
+            return Err(message);
         }
         Ok(())
     }
@@ -337,6 +396,52 @@ mod tests {
         assert_eq!(dialog.selected_device(hwnd), Some(&None));
         unsafe { DestroyWindow(hwnd) };
     }
+
+    #[test]
+    fn settings_dialog_displays_and_saves_the_shared_language() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dflow.toml");
+        std::fs::write(&path, "[ui]\nlanguage = \"zh-CN\"\n").unwrap();
+        let (_, scan) = mpsc::channel();
+        let mut dialog = Dialog {
+            owner: null_mut(),
+            config: Config::load(path.clone()),
+            binding: Some(Binding {
+                id: 1,
+                hotkey: Hotkey::default(),
+            }),
+            command: String::new(),
+            startup: None,
+            devices: Vec::new(),
+            scan,
+        };
+        let hwnd =
+            unsafe { CreateDialogParamW(instance(), 100usize as *const u16, null_mut(), None, 0) };
+        assert!(!hwnd.is_null());
+        dialog.populate(hwnd);
+        assert_eq!(get(hwnd, LANGUAGE_LABEL), "界面语言");
+        assert_eq!(get(hwnd, STARTUP), "开机自启动");
+        assert_eq!(get(hwnd, PROXY_ON), "使用网络代理");
+        assert_eq!(get(hwnd, LAUNCH_PREVIEW), "启动提示");
+        assert_eq!(get(hwnd, RESTART_HINT), "界面语言将在重启后生效");
+        assert_eq!(
+            unsafe { SendDlgItemMessageW(hwnd, LANGUAGE, CB_GETCURSEL, 0, 0) },
+            2
+        );
+
+        unsafe { SendDlgItemMessageW(hwnd, LANGUAGE, CB_SETCURSEL, 1, 0) };
+        dialog.save(hwnd).unwrap();
+        assert_eq!(dialog.config.locale, Locale::SimplifiedChinese);
+        dialog.config = Config::load(path);
+        dialog.populate(hwnd);
+        assert_eq!(get(hwnd, LANGUAGE_LABEL), "Interface language");
+        assert_eq!(get(hwnd, STARTUP), "Start with Windows");
+        unsafe { DestroyWindow(hwnd) };
+    }
+}
+
+fn add_combo_item(hwnd: HWND, id: i32, label: &str) {
+    unsafe { SendDlgItemMessageW(hwnd, id, CB_ADDSTRING, 0, wide(label).as_ptr() as LPARAM) };
 }
 
 fn set(hwnd: HWND, id: i32, text: &str) {

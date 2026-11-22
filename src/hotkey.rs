@@ -1,3 +1,4 @@
+use crate::locale::Locale;
 use std::{fmt, str::FromStr};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +15,19 @@ impl Default for Hotkey {
             modifiers: 2 | 4,
             key: 0xbf,
         }
+    }
+}
+
+impl Hotkey {
+    pub fn parse_localized(value: &str, locale: Locale) -> Result<Self, String> {
+        value.parse().map_err(|error| {
+            locale
+                .text(
+                    error,
+                    "请输入包含修饰键和普通按键的快捷键，例如 Ctrl+Shift+/",
+                )
+                .to_owned()
+        })
     }
 }
 

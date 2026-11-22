@@ -1,6 +1,7 @@
 use crate::{
     codex::{Codex, Transcriber, login_status},
     config::Settings,
+    locale::Locale,
     transcript::{Transcript, clean_text},
 };
 use cpal::{
@@ -36,11 +37,15 @@ pub struct InputDevice {
     pub label: String,
 }
 
-pub fn devices() -> Result<Vec<InputDevice>, String> {
+pub fn devices(locale: Locale) -> Result<Vec<InputDevice>, String> {
     let host = cpal::default_host();
     let mut devices: Vec<_> = host
         .input_devices()
-        .map_err(|_| "Could not list microphone inputs.".to_owned())?
+        .map_err(|_| {
+            locale
+                .text("Could not list microphone inputs.", "无法获取麦克风列表")
+                .to_owned()
+        })?
         .filter_map(|device| {
             Some(InputDevice {
                 id: device.id().ok()?.to_string(),
@@ -73,12 +78,12 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn start(settings: Settings) -> Self {
+    pub fn start(settings: Settings, locale: Locale) -> Self {
         let (updates, result) = mpsc::channel();
         let state = Arc::new(AtomicU8::new(RECORDING));
         let worker_state = Arc::clone(&state);
         thread::spawn(move || {
-            if let Err(error) = record(settings, &worker_state, &updates) {
+            if let Err(error) = record(settings, &worker_state, &updates, locale) {
                 report_failure(&worker_state, &updates, error);
             }
         });
@@ -112,23 +117,30 @@ fn record(
     settings: Settings,
     state: &Arc<AtomicU8>,
     updates: &Sender<Update>,
+    locale: Locale,
 ) -> Result<(), String> {
-    login_status(&settings.auth_file()?)?;
+    login_status(&settings.auth_file(locale)?, locale)?;
     let host = cpal::default_host();
     let device = match settings.device.as_deref() {
-        None => host
-            .default_input_device()
-            .ok_or("No default microphone. Choose one with /device.")?,
+        None => host.default_input_device().ok_or(locale.text(
+            "No default microphone. Choose one in Settings.",
+            "没有默认麦克风，请在设置中选择",
+        ))?,
         Some(id) => {
-            let id = id
-                .parse()
-                .map_err(|_| "Invalid saved microphone ID. Choose one with /device.")?;
-            host.device_by_id(&id)
-                .ok_or("The saved microphone is unavailable. Choose one with /device.")?
+            let id = id.parse().map_err(|_| {
+                locale.text(
+                    "Invalid saved microphone ID. Choose one in Settings.",
+                    "保存的麦克风 ID 无效，请在设置中重新选择",
+                )
+            })?;
+            host.device_by_id(&id).ok_or(locale.text(
+                "The saved microphone is unavailable. Choose one in Settings.",
+                "所选麦克风不可用，请在设置中重新选择",
+            ))?
         }
     };
     let supported = device.default_input_config().map_err(|_| {
-        "Could not open the selected microphone. Check Windows microphone access or use /device."
+        locale.text("Could not open the selected microphone. Check microphone access or choose another in Settings.", "无法打开所选麦克风，请检查麦克风权限或在设置中选择其他设备")
     })?;
     let format = supported.sample_format();
     let config = supported.config();
@@ -140,6 +152,7 @@ fn record(
         format,
         samples_tx,
         Arc::clone(&stream_failed),
+        locale,
     )?;
 
     if state.load(Ordering::Acquire) != RECORDING {
@@ -148,27 +161,29 @@ fn record(
     }
     stream
         .play()
-        .map_err(|_| "Could not start the microphone.")?;
+        .map_err(|_| locale.text("Could not start the microphone.", "无法启动麦克风"))?;
     let _ = updates.send(Update::Live);
 
     let (chunk_tx, chunk_rx) = mpsc::sync_channel(8);
     let upload_updates = updates.clone();
     let upload_state = Arc::clone(state);
-    thread::spawn(move || match Codex::new(settings) {
-        Ok(codex) => upload(codex, chunk_rx, &upload_updates, &upload_state),
+    thread::spawn(move || match Codex::new(settings, locale) {
+        Ok(codex) => upload(codex, chunk_rx, &upload_updates, &upload_state, locale),
         Err(error) => report_failure(&upload_state, &upload_updates, error),
     });
 
     let capture = || -> Result<(), String> {
         let rate = config.sample_rate as usize;
-        let mut chunker = Chunker::new(rate);
+        let mut chunker = Chunker::new(rate, locale);
         let started = Instant::now();
         let mut monitor = InputMonitor::new(started);
         while state.load(Ordering::Acquire) == RECORDING
             && started.elapsed() < Duration::from_secs(300)
         {
             if stream_failed.load(Ordering::Acquire) {
-                return Err("Microphone capture was interrupted.".into());
+                return Err(locale
+                    .text("Microphone capture was interrupted.", "麦克风录音已中断")
+                    .into());
             }
             match samples_rx.recv_timeout(Duration::from_millis(20)) {
                 Ok(samples) => {
@@ -177,7 +192,9 @@ fn record(
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => check_input(&mut monitor, &[], updates),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("Microphone capture was interrupted.".into());
+                    return Err(locale
+                        .text("Microphone capture was interrupted.", "麦克风录音已中断")
+                        .into());
                 }
             }
         }
@@ -240,6 +257,7 @@ fn upload(
     chunks: Receiver<Vec<i16>>,
     updates: &Sender<Update>,
     state: &AtomicU8,
+    locale: Locale,
 ) {
     let mut transcript = Transcript::default();
     let mut previous = Vec::new();
@@ -257,7 +275,14 @@ fn upload(
             }
             current.extend(next);
         }
-        match transcribe_chunk(&mut provider, &previous, &current, &mut transcript, state) {
+        match transcribe_chunk(
+            &mut provider,
+            &previous,
+            &current,
+            &mut transcript,
+            state,
+            locale,
+        ) {
             Ok(true) => {
                 if updates
                     .send(Update::Transcript(transcript.text().to_owned()))
@@ -285,9 +310,11 @@ fn transcribe_chunk(
     current: &[i16],
     transcript: &mut Transcript,
     state: &AtomicU8,
+    locale: Locale,
 ) -> Result<bool, String> {
     let combined = if transcript.has_tail() {
-        let Some(combined) = request_transcript(provider, previous.iter().chain(current), state)?
+        let Some(combined) =
+            request_transcript(provider, previous.iter().chain(current), state, locale)?
         else {
             return Ok(false);
         };
@@ -299,7 +326,7 @@ fn transcribe_chunk(
         None
     };
 
-    let Some(text) = request_transcript(provider, current.iter(), state)? else {
+    let Some(text) = request_transcript(provider, current.iter(), state, locale)? else {
         return Ok(false);
     };
     if !combined.is_some_and(|combined| transcript.merge(&combined, Some(&text))) {
@@ -312,11 +339,16 @@ fn request_transcript<'a>(
     provider: &mut impl Transcriber,
     samples: impl Iterator<Item = &'a i16>,
     state: &AtomicU8,
+    locale: Locale,
 ) -> Result<Option<String>, String> {
-    let wav = wav(samples.copied()).map_err(|_| "Could not encode microphone audio.")?;
-    let slot = REQUEST_SLOT
-        .lock()
-        .map_err(|_| "The transcription worker stopped unexpectedly.")?;
+    let wav = wav(samples.copied())
+        .map_err(|_| locale.text("Could not encode microphone audio.", "无法编码麦克风音频"))?;
+    let slot = REQUEST_SLOT.lock().map_err(|_| {
+        locale.text(
+            "The transcription worker stopped unexpectedly.",
+            "转写任务意外中断",
+        )
+    })?;
     if state.load(Ordering::Acquire) == CANCELLED {
         return Ok(None);
     }
@@ -334,6 +366,7 @@ fn microphone(
     format: SampleFormat,
     samples: SyncSender<Vec<f32>>,
     failed: Arc<AtomicBool>,
+    locale: Locale,
 ) -> Result<Stream, String> {
     let stream = match format {
         SampleFormat::F32 => input::<f32>(device, config, samples, failed),
@@ -344,14 +377,21 @@ fn microphone(
         SampleFormat::U8 => input::<u8>(device, config, samples, failed),
         SampleFormat::U16 => input::<u16>(device, config, samples, failed),
         _ => {
-            return Err(
-                "This microphone's sample format is unsupported. Choose another with /device."
-                    .into(),
-            );
+            return Err(locale
+                .text(
+                    "This microphone's sample format is unsupported. Choose another in Settings.",
+                    "不支持此麦克风的采样格式，请在设置中选择其他设备",
+                )
+                .into());
         }
     };
     stream.map_err(|_| {
-        "Could not start microphone capture. Check Windows microphone permissions.".into()
+        locale
+            .text(
+                "Could not start microphone capture. Check microphone permissions.",
+                "无法开始录音，请检查麦克风权限",
+            )
+            .into()
     })
 }
 
@@ -390,13 +430,15 @@ where
 
 struct Chunker {
     rate: usize,
+    locale: Locale,
     samples: Vec<f32>,
 }
 
 impl Chunker {
-    fn new(rate: usize) -> Self {
+    fn new(rate: usize, locale: Locale) -> Self {
         Self {
             rate,
+            locale,
             samples: Vec::with_capacity(rate * MAX_CHUNK_SECONDS),
         }
     }
@@ -406,7 +448,7 @@ impl Chunker {
         let limit = self.rate * MAX_CHUNK_SECONDS;
         while self.samples.len() >= limit {
             let chunk: Vec<_> = self.samples.drain(..limit).collect();
-            send_chunk(&chunk, self.rate, queue)?;
+            send_chunk(&chunk, self.rate, queue, self.locale)?;
         }
         let pause_samples = self.rate * PAUSE_MS / 1_000;
         if self.samples.len() >= self.rate * MIN_CHUNK_MS / 1_000 {
@@ -424,13 +466,18 @@ impl Chunker {
     }
 
     fn flush(&mut self, queue: &SyncSender<Vec<i16>>) -> Result<(), String> {
-        let result = send_chunk(&self.samples, self.rate, queue);
+        let result = send_chunk(&self.samples, self.rate, queue, self.locale);
         self.samples.clear();
         result
     }
 }
 
-fn send_chunk(samples: &[f32], rate: usize, queue: &SyncSender<Vec<i16>>) -> Result<(), String> {
+fn send_chunk(
+    samples: &[f32],
+    rate: usize,
+    queue: &SyncSender<Vec<i16>>,
+    locale: Locale,
+) -> Result<(), String> {
     if !has_speech(samples, rate) {
         return Ok(());
     }
@@ -443,9 +490,14 @@ fn send_chunk(samples: &[f32], rate: usize, queue: &SyncSender<Vec<i16>>) -> Res
             (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
         })
         .collect();
-    queue
-        .try_send(pcm)
-        .map_err(|_| "Transcription could not keep up. Try a shorter dictation.".into())
+    queue.try_send(pcm).map_err(|_| {
+        locale
+            .text(
+                "Transcription could not keep up. Try a shorter dictation.",
+                "转写速度跟不上录音，请缩短单次听写时间",
+            )
+            .into()
+    })
 }
 
 fn has_speech(samples: &[f32], rate: usize) -> bool {
@@ -475,6 +527,26 @@ fn wav(samples: impl IntoIterator<Item = i16>) -> Result<Vec<u8>, hound::Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_login_reports_an_error_in_the_session_language() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings = Settings {
+            auth_path: Some(directory.path().join("auth.json")),
+            ..Settings::default()
+        };
+        for (locale, expected) in [
+            (Locale::English, "Codex login file not found"),
+            (Locale::SimplifiedChinese, "找不到 Codex 登录文件"),
+        ] {
+            let session = Session::start(settings.clone(), locale);
+            let update = session
+                .updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            assert!(matches!(update, Update::Failed(message) if message.starts_with(expected)));
+        }
+    }
     use crate::editor::{Editor, Movement};
 
     #[test]
@@ -500,7 +572,7 @@ mod tests {
     fn chunks_wait_for_a_pause_or_the_hard_limit() {
         let rate = WAV_RATE as usize;
         let (queue, output) = mpsc::sync_channel(2);
-        let mut chunker = Chunker::new(rate);
+        let mut chunker = Chunker::new(rate, Locale::English);
         chunker.push(vec![0.5; rate * 650 / 1_000], &queue).unwrap();
         chunker
             .push(vec![0.0; rate * 350 / 1_000 - 1], &queue)
@@ -518,7 +590,7 @@ mod tests {
     fn silence_stays_out_of_the_upload_queue_and_stop_flushes_short_speech() {
         let rate = WAV_RATE as usize;
         let (queue, output) = mpsc::sync_channel(2);
-        let mut chunker = Chunker::new(rate);
+        let mut chunker = Chunker::new(rate, Locale::English);
         chunker.push(vec![0.0001; rate * 8], &queue).unwrap();
         assert_eq!(chunker.samples.len(), rate * 350 / 1_000);
         assert!(output.try_recv().is_err());
@@ -551,7 +623,13 @@ mod tests {
         }
         drop(chunks);
         let (updates, received) = mpsc::channel();
-        upload(Fake, pending, &updates, &AtomicU8::new(STOPPING));
+        upload(
+            Fake,
+            pending,
+            &updates,
+            &AtomicU8::new(STOPPING),
+            Locale::English,
+        );
         assert!(
             matches!(received.recv().unwrap(), Update::Transcript(text) if text == "First and second.")
         );
@@ -594,6 +672,7 @@ mod tests {
                 },
                 [1].iter(),
                 &worker_state,
+                Locale::English,
             )
         });
         old_request.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -603,7 +682,12 @@ mod tests {
         let (started, new_worker) = mpsc::channel();
         let new = thread::spawn(move || {
             started.send(()).unwrap();
-            request_transcript(&mut Next(entered), [2].iter(), &AtomicU8::new(RECORDING))
+            request_transcript(
+                &mut Next(entered),
+                [2].iter(),
+                &AtomicU8::new(RECORDING),
+                Locale::English,
+            )
         });
         new_worker.recv_timeout(Duration::from_secs(2)).unwrap();
         let early = new_request.recv_timeout(Duration::from_millis(100));
@@ -644,8 +728,15 @@ mod tests {
         }
         let (chunks, pending) = mpsc::channel();
         let (updates, received) = mpsc::channel();
-        let worker =
-            thread::spawn(move || upload(Fake, pending, &updates, &AtomicU8::new(RECORDING)));
+        let worker = thread::spawn(move || {
+            upload(
+                Fake,
+                pending,
+                &updates,
+                &AtomicU8::new(RECORDING),
+                Locale::English,
+            )
+        });
         let mut editor = Editor::default();
         editor.insert("Before after");
         editor.move_caret(Movement::Home, false, 80);

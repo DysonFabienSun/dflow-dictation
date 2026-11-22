@@ -5,7 +5,13 @@ mod cache;
 mod terminal_input;
 mod ui;
 
-use dflow_scratchpad::{audio, clipboard, codex, config, editor, transcript};
+use dflow_scratchpad::{
+    audio, clipboard, codex,
+    config::{self, Config},
+    editor,
+    locale::Locale,
+    transcript,
+};
 
 use crossterm::{
     cursor::Show,
@@ -100,22 +106,37 @@ impl Drop for Screen {
     }
 }
 
-fn run(path: std::path::PathBuf, agent_access: bool) -> io::Result<()> {
-    let cache_path = path
+fn run(config: Config, agent_access: bool) -> io::Result<()> {
+    let locale = config.locale;
+    let cache_path = config
+        .path
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| io::Error::other("Cannot locate the DFlow executable directory."))?
+        .ok_or_else(|| {
+            io::Error::other(locale.text(
+                "Cannot locate the DFlow executable directory.",
+                "无法定位 DFlow 程序目录",
+            ))
+        })?
         .join("cache")
         .join("note.json");
-    let mut app = app::App::new(config::Config::load(path));
+    let mut app = app::App::new(config);
     match cache::CachedNote::load(&cache_path) {
         Ok(note) => app.editor = note.into_editor(),
-        Err(_) => app.cache_error = Some("Could not restore note · check cache/note.json"),
+        Err(_) => {
+            app.cache_error = Some(locale.text(
+                "Could not restore note · check cache/note.json",
+                "无法恢复便笺 · 请检查 cache/note.json",
+            ))
+        }
     }
     let mut cache = match cache::NoteCache::start(cache_path, app.editor.cursor()) {
         Ok(cache) => Some(cache),
         Err(_) => {
-            app.cache_error = Some("Could not start saving the note cache");
+            app.cache_error = Some(locale.text(
+                "Could not start saving the note cache",
+                "无法启动便笺缓存保存任务",
+            ));
             None
         }
     };
@@ -123,7 +144,13 @@ fn run(path: std::path::PathBuf, agent_access: bool) -> io::Result<()> {
     if let Some(cache) = cache
         && cache.finish(app.revision(), &app.editor).is_err()
     {
-        eprintln!("DFlow: Could not save the note cache. Check cache/note.json.");
+        eprintln!(
+            "DFlow: {}",
+            locale.text(
+                "Could not save the note cache. Check cache/note.json.",
+                "无法保存便笺缓存，请检查 cache/note.json"
+            )
+        );
     }
     result
 }
@@ -143,7 +170,10 @@ fn run_terminal(
         match agent::Window::start() {
             Ok(window) => Some(window),
             Err(error) => {
-                app.set_agent_error(format!("Agent access unavailable: {error}"));
+                app.set_agent_error(match app.locale {
+                    Locale::English => format!("Agent access unavailable: {error}"),
+                    Locale::SimplifiedChinese => format!("无法启用本地代理访问：{error}"),
+                });
                 None
             }
         }
@@ -165,7 +195,10 @@ fn run_terminal(
         if let Some(cache) = cache.as_deref_mut()
             && let Some(saved) = cache.update(app.revision(), &app.editor)
         {
-            let error = (!saved).then_some("Could not save note · check cache/note.json");
+            let error = (!saved).then_some(app.locale.text(
+                "Could not save note · check cache/note.json",
+                "无法保存便笺 · 请检查 cache/note.json",
+            ));
             redraw |= app.cache_error != error;
             app.cache_error = error;
         }
@@ -196,6 +229,12 @@ fn read_event(timeout: Duration) -> io::Result<Option<event::Event>> {
     Ok(None)
 }
 
+fn cli_locale() -> Locale {
+    config::settings_path()
+        .map(|path| Config::load(path).locale)
+        .unwrap_or_else(|_| Locale::system())
+}
+
 fn main() -> std::process::ExitCode {
     use std::process::ExitCode;
     let mut arguments = env::args_os().skip(1);
@@ -203,9 +242,10 @@ fn main() -> std::process::ExitCode {
     if let Some(first) = arguments.next() {
         match first.to_str() {
             Some("--help" | "-h") if arguments.next().is_none() => {
-                println!(
-                    "DFlow Scratchpad\n\nUsage: dflow [--no-agent-access]\n       dflow --mcp\n\nOpen DFlow Scratchpad in PowerShell 7 under Windows Terminal.\nClick to place the caret or drag to select text.\nCtrl+Space dictates and Esc opens commands.\nCtrl+Z undoes, Ctrl+Y redoes, Ctrl+C copies, and Ctrl+X cuts.\nUse :q or /quit from the command menu to exit."
-                );
+                println!("{}", cli_locale().text(
+                    "DFlow Scratchpad\n\nUsage: dflow [--no-agent-access]\n       dflow --mcp\n\nOpen DFlow Scratchpad in PowerShell 7 under Windows Terminal.\nClick to place the caret or drag to select text.\nCtrl+Space dictates and Esc opens commands.\nCtrl+Z undoes, Ctrl+Y redoes, Ctrl+C copies, and Ctrl+X cuts.\nUse :q or /quit from the command menu to exit.",
+                    "DFlow 便笺\n\n用法：dflow [--no-agent-access]\n      dflow --mcp\n\n请在 Windows Terminal 的 PowerShell 7 中运行 DFlow 便笺\n单击定位光标，拖动选择文字\nCtrl+Space 听写，Esc 打开命令列表\nCtrl+Z 撤销，Ctrl+Y 重做，Ctrl+C 复制，Ctrl+X 剪切\n在命令列表中使用 :q 或 /quit 退出",
+                ));
                 return ExitCode::SUCCESS;
             }
             Some("--version" | "-V") if arguments.next().is_none() => {
@@ -225,20 +265,33 @@ fn main() -> std::process::ExitCode {
                 agent_access = false;
             }
             _ => {
-                eprintln!("DFlow: unrecognized arguments. Run dflow --help.");
+                eprintln!(
+                    "DFlow: {}",
+                    cli_locale().text(
+                        "unrecognized arguments. Run dflow --help.",
+                        "无法识别参数，请运行 dflow --help"
+                    )
+                );
                 return ExitCode::FAILURE;
             }
         }
     }
+    let config = match config::settings_path() {
+        Ok(path) => Config::load(path),
+        Err(error) => {
+            let message = Locale::system().text("Could not locate settings", "无法定位设置文件");
+            eprintln!("DFlow: {message} · {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let locale = config.locale;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        eprintln!(
-            "DFlow needs an interactive terminal. Open it in PowerShell 7 under Windows Terminal."
-        );
+        eprintln!("{}", locale.text("DFlow needs an interactive terminal. Open it in PowerShell 7 under Windows Terminal.", "DFlow 需要交互式终端，请在 Windows Terminal 的 PowerShell 7 中运行"));
         return ExitCode::FAILURE;
     }
-    let result = config::settings_path().and_then(|path| run(path, agent_access));
-    if let Err(error) = result {
-        eprintln!("DFlow: {error}");
+    if let Err(error) = run(config, agent_access) {
+        let message = locale.text("Could not run the scratchpad", "便笺运行失败");
+        eprintln!("DFlow: {message} · {error}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

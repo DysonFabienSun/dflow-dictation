@@ -25,7 +25,7 @@ jobs:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
 
-      - name: Verify version and build DFlow
+      - name: Verify version and assemble release notes
         shell: pwsh
         run: |
           $metadata = cargo metadata --locked --no-deps --format-version 1
@@ -35,22 +35,7 @@ jobs:
             throw "Tag $env:RELEASE_TAG does not match Cargo version v$version."
           }
 
-          cargo build --locked --release --bins
-          if ($LASTEXITCODE -ne 0) { throw 'Cargo release build failed.' }
-
-      - name: Create a draft release with both apps and setup instructions
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $executables = './target/release/dflow.exe', './target/release/dflow-dictation.exe'
-          foreach ($exe in $executables) {
-            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-              throw "Missing Windows release executable $exe."
-            }
-          }
-
-          # Restore the original tag object so gh can read its annotation.
+          # Restore the original tag object so its annotation is available.
           $tagRef = "refs/tags/$env:RELEASE_TAG"
           git fetch --force --no-tags origin "${tagRef}:${tagRef}"
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the release tag.' }
@@ -69,9 +54,33 @@ jobs:
           $changelog = ($lines -join "`n").TrimEnd("`r", "`n")
           if ([string]::IsNullOrWhiteSpace($changelog)) { throw 'The changelog is empty.' }
           $quickStart = Get-Content -LiteralPath '.github/release-quickstart.md' -Raw -ErrorAction Stop
-          $notes = $changelog + "`n`n" + $quickStart.TrimEnd() + "`n"
+          $sections = @($changelog)
+          if ($env:RELEASE_TAG -cnotin @('v0.3.0', 'v0.3.1')) {
+            $sourceUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/blob/$tagCommit"
+            $sections += & ./.github/release-doc-links.ps1 -Tag $env:RELEASE_TAG -SourceUrl $sourceUrl
+          }
+          $sections += $quickStart.TrimEnd()
+          $notes = ($sections -join "`n`n") + "`n"
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -LiteralPath $notesFile -Value $notes -Encoding utf8NoBOM -NoNewline -ErrorAction Stop
 
+      - name: Build DFlow
+        shell: pwsh
+        run: |
+          cargo build --locked --release --bins
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo release build failed.' }
+
+      - name: Create a draft release with both apps and setup instructions
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $executables = './target/release/dflow.exe', './target/release/dflow-dictation.exe'
+          foreach ($exe in $executables) {
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+              throw "Missing Windows release executable $exe."
+            }
+          }
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           gh release create "$env:RELEASE_TAG" @executables --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }

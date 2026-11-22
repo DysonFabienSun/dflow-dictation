@@ -10,6 +10,7 @@ use crate::{
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use dflow_scratchpad::locale::{Language, Locale};
 use ratatui::layout::{Position, Rect};
 use std::{
     ops::Range,
@@ -30,6 +31,8 @@ enum Action {
     Redo,
     Settings,
     Devices,
+    Language,
+    SetLanguage(Language),
     Provider,
     Proxy,
     SetProxyEnabled(bool),
@@ -60,7 +63,18 @@ impl Row {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuKind {
+    Commands,
+    Settings,
+    Devices,
+    Language,
+    Provider,
+    Proxy,
+}
+
 pub struct Menu {
+    kind: MenuKind,
     pub title: &'static str,
     pub context: Vec<String>,
     pub query: Option<CommandQuery>,
@@ -150,10 +164,19 @@ pub enum InputKind {
 }
 
 impl InputKind {
-    pub fn labels(&self) -> (&'static str, &'static str) {
+    pub fn labels(&self, locale: Locale) -> (&'static str, &'static str) {
         match self {
-            Self::AuthPath => ("Codex auth file", "Absolute path"),
-            Self::ProxyUrl => ("Proxy address", "http://, https:// or socks5://"),
+            Self::AuthPath => (
+                locale.text("Codex auth file", "Codex 登录文件"),
+                locale.text("Absolute path", "绝对路径"),
+            ),
+            Self::ProxyUrl => (
+                locale.text("Proxy address", "代理地址"),
+                locale.text(
+                    "http://, https:// or socks5://",
+                    "http://、https:// 或 socks5://",
+                ),
+            ),
         }
     }
 }
@@ -225,6 +248,7 @@ impl SpaceGesture {
 
 pub struct App {
     pub editor: Editor,
+    pub locale: Locale,
     pub panes: Vec<Pane>,
     pub top_row: usize,
     pub note_area: Rect,
@@ -253,6 +277,7 @@ impl App {
     pub fn new(config: Config) -> Self {
         Self {
             editor: Editor::default(),
+            locale: config.locale,
             panes: Vec::new(),
             top_row: 0,
             note_area: Rect::ZERO,
@@ -277,29 +302,53 @@ impl App {
     }
 
     pub fn status(&self) -> (&str, bool) {
+        let locale = self.locale;
         if let Some(dictation) = &self.dictation {
             return match dictation.phase {
                 DictationPhase::Pending => ("", false),
-                DictationPhase::Live { quiet: true } => {
-                    ("Mic input is quiet · check /device or input gain", true)
-                }
+                DictationPhase::Live { quiet: true } => (
+                    locale.text(
+                        "Mic input is quiet · check /device or input gain",
+                        "麦克风输入音量较低 · 请检查 /device 或提高输入音量",
+                    ),
+                    true,
+                ),
                 DictationPhase::Live { quiet: false }
                     if dictation.gesture == SpaceGesture::Hold =>
                 {
-                    ("● Recording · release Space to stop · Esc cancel", false)
+                    (
+                        locale.text(
+                            "● Recording · release Space to stop · Esc cancel",
+                            "● 正在录音 · 松开空格键停止 · Esc 取消",
+                        ),
+                        false,
+                    )
                 }
                 DictationPhase::Live { quiet: false }
                     if matches!(dictation.gesture, SpaceGesture::Pressing(_)) =>
                 {
                     (
-                        "● Recording · release to keep recording · hold for push-to-talk",
+                        locale.text(
+                            "● Recording · release to keep recording · hold for push-to-talk",
+                            "● 正在录音 · 松开后继续录音 · 按住可持续听写",
+                        ),
                         false,
                     )
                 }
-                DictationPhase::Live { quiet: false } => {
-                    ("● Recording · Ctrl+Space stop · Esc cancel", false)
-                }
-                DictationPhase::Finishing => ("Finishing transcription… · Esc cancel", false),
+                DictationPhase::Live { quiet: false } => (
+                    locale.text(
+                        "● Recording · Ctrl+Space stop · Esc cancel",
+                        "● 正在录音 · Ctrl+Space 停止 · Esc 取消",
+                    ),
+                    false,
+                ),
+                DictationPhase::Finishing => (
+                    locale.text(
+                        "Finishing transcription… · Esc cancel",
+                        "正在完成转写… · Esc 取消",
+                    ),
+                    false,
+                ),
             };
         }
         if let Some(notice) = &self.notice {
@@ -309,10 +358,22 @@ impl App {
             return (error, true);
         }
         if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.query.is_some()) {
-            return ("↑↓ select · Tab complete · Enter run · Esc close", false);
+            return (
+                locale.text(
+                    "↑↓ select · Tab complete · Enter run · Esc close",
+                    "↑↓ 选择 · Tab 补全 · Enter 运行 · Esc 关闭",
+                ),
+                false,
+            );
         }
         if !self.panes.is_empty() {
-            return ("↑↓ select · Enter confirm · Esc back", false);
+            return (
+                locale.text(
+                    "↑↓ select · Enter confirm · Esc back",
+                    "↑↓ 选择 · Enter 确认 · Esc 返回",
+                ),
+                false,
+            );
         }
         if let Some(error) = self.cache_error {
             return (error, true);
@@ -320,7 +381,13 @@ impl App {
         if let Some(error) = &self.agent_error {
             return (error, true);
         }
-        ("Ctrl+Space dictate · Esc commands · Ctrl+Z undo", false)
+        (
+            locale.text(
+                "Ctrl+Space dictate · Esc commands · Ctrl+Z undo",
+                "Ctrl+Space 听写 · Esc 命令列表 · Ctrl+Z 撤销",
+            ),
+            false,
+        )
     }
 
     pub fn copied_characters(&self) -> Option<usize> {
@@ -328,6 +395,7 @@ impl App {
     }
 
     pub fn tick(&mut self) -> bool {
+        let locale = self.locale;
         let now = Instant::now();
         let mut redraw = self.poll_devices();
         if let Some(cut) = &mut self.pending_cut {
@@ -346,7 +414,11 @@ impl App {
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
                     self.pending_cut = None;
-                    self.notice = Some("Could not update the Windows clipboard.".into());
+                    self.notice = Some(
+                        locale
+                            .text("Could not update the Windows clipboard.", "无法写入剪贴板")
+                            .into(),
+                    );
                     redraw = true;
                 }
                 Err(oneshot::error::TryRecvError::Empty) => {}
@@ -362,7 +434,11 @@ impl App {
                     self.copied = Some((count, now + Duration::from_millis(1200)))
                 }
                 ClipboardFeedback::Failed => {
-                    self.notice = Some("Could not update the Windows clipboard.".into())
+                    self.notice = Some(
+                        locale
+                            .text("Could not update the Windows clipboard.", "无法写入剪贴板")
+                            .into(),
+                    )
                 }
             }
             redraw = true;
@@ -378,9 +454,11 @@ impl App {
             let update = match dictation.session.updates.try_recv() {
                 Ok(update) => update,
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    Update::Failed("Dictation ended unexpectedly.".into())
-                }
+                Err(TryRecvError::Disconnected) => Update::Failed(
+                    locale
+                        .text("Dictation ended unexpectedly.", "听写意外中断")
+                        .into(),
+                ),
             };
             redraw = true;
             match update {
@@ -574,7 +652,7 @@ impl App {
         let changed = match key.code {
             KeyCode::Esc => {
                 self.editor.end_burst();
-                self.panes.push(Pane::Menu(commands(false)));
+                self.panes.push(Pane::Menu(commands(false, self.locale)));
                 return;
             }
             KeyCode::Char('/')
@@ -615,7 +693,7 @@ impl App {
             KeyCode::Char('/') => {
                 if self.panes.is_empty() {
                     self.editor.end_burst();
-                    self.panes.push(Pane::Menu(commands(true)));
+                    self.panes.push(Pane::Menu(commands(true, self.locale)));
                     self.notice = None;
                 } else if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.query.is_some())
                 {
@@ -652,7 +730,7 @@ impl App {
         self.editor.clear_selection();
         self.editor.begin();
         self.dictation = Some(Dictation {
-            session: Session::start(self.config.settings.clone()),
+            session: Session::start(self.config.settings.clone(), self.locale),
             gesture: SpaceGesture::Pressing(pressed),
             phase: DictationPhase::Pending,
             range: cursor..cursor,
@@ -701,7 +779,11 @@ impl App {
                 });
             }
         } else {
-            self.notice = Some("The Windows clipboard is busy.".into());
+            self.notice = Some(
+                self.locale
+                    .text("The Windows clipboard is busy.", "剪贴板正被占用")
+                    .into(),
+            );
         }
     }
 
@@ -820,6 +902,7 @@ impl App {
     }
 
     fn perform(&mut self, action: Action) {
+        let locale = self.locale;
         if matches!(action, Action::Back) {
             self.panes.pop();
             return;
@@ -850,6 +933,8 @@ impl App {
             }
             Action::Settings => self.open_settings(),
             Action::Devices => self.open_devices(),
+            Action::Language => self.open_language(),
+            Action::SetLanguage(language) => self.set_language(language),
             Action::Provider => self.open_provider(),
             Action::Proxy => self.open_proxy(),
             Action::SetProxyEnabled(enabled) => {
@@ -868,7 +953,7 @@ impl App {
                     .trim_end_matches('/')
                     .to_owned(),
             }),
-            Action::SaveProxyUrl(input) => match parse_proxy_url(&input) {
+            Action::SaveProxyUrl(input) => match parse_proxy_url(&input, locale) {
                 Ok(url) => self.save_proxy(
                     ProxySettings {
                         url,
@@ -887,7 +972,7 @@ impl App {
                         self.panes.pop();
                         self.refresh_settings_menu();
                     }
-                    Err(error) => self.notice = Some(error),
+                    Err(error) => self.notice = Some(error.restart_message(&self.config)),
                 }
             }
             Action::EditAuthPath => {
@@ -906,13 +991,19 @@ impl App {
             Action::SaveAuthPath(path) => {
                 let path = PathBuf::from(path.trim());
                 if path.is_absolute() {
-                    match login_status(&path) {
+                    match login_status(&path, locale) {
                         Ok(_) => self.save_auth(Some(path), true),
                         Err(error) => self.notice = Some(error),
                     }
                 } else {
-                    self.notice =
-                        Some("Enter the absolute path to the Codex auth.json file.".into());
+                    self.notice = Some(
+                        locale
+                            .text(
+                                "Enter the absolute path to the Codex auth.json file.",
+                                "请输入 Codex 登录文件 auth.json 的绝对路径",
+                            )
+                            .into(),
+                    );
                 }
             }
         }
@@ -929,11 +1020,12 @@ impl App {
                 self.panes.pop();
                 self.open_provider();
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.notice = Some(error.restart_message(&self.config)),
         }
     }
 
     fn save_proxy(&mut self, proxy: ProxySettings, editing: bool) {
+        let locale = self.locale;
         let mut settings = self.config.settings.clone();
         settings.proxy = proxy;
         match self.config.save(settings) {
@@ -941,36 +1033,52 @@ impl App {
                 if editing {
                     self.panes.pop();
                 }
-                if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.title == "Proxy") {
+                if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.kind == MenuKind::Proxy)
+                {
                     self.panes.pop();
                     self.refresh_settings_menu();
                     self.open_proxy();
                 } else {
                     self.notice = Some(if self.config.settings.proxy.enabled {
-                        "Proxy enabled for Codex.".into()
+                        locale
+                            .text("Proxy enabled for Codex.", "已启用网络代理")
+                            .into()
                     } else {
-                        "Proxy disabled. Codex will connect directly.".into()
+                        locale
+                            .text(
+                                "Proxy disabled. Codex will connect directly.",
+                                "已关闭网络代理，将直接连接 ChatGPT",
+                            )
+                            .into()
                     });
                 }
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.notice = Some(error.restart_message(&self.config)),
         }
     }
 
     fn open_proxy(&mut self) {
+        let locale = self.locale;
         let proxy = &self.config.settings.proxy;
         let status = if proxy.enabled {
-            "On"
+            locale.text("On", "已启用")
         } else {
-            "Off · direct connection"
+            locale.text("Off · direct connection", "已关闭 · 直接连接")
         };
         let (label, detail) = if proxy.enabled {
-            ("Turn off", "Connect directly")
+            (
+                locale.text("Turn off", "关闭代理"),
+                locale.text("Connect directly", "直接连接"),
+            )
         } else {
-            ("Turn on", "Use this proxy for Codex")
+            (
+                locale.text("Turn on", "启用代理"),
+                locale.text("Use this proxy for Codex", "使用此代理连接 ChatGPT"),
+            )
         };
         self.panes.push(Pane::Menu(Menu {
-            title: "Proxy",
+            kind: MenuKind::Proxy,
+            title: locale.text("Proxy", "网络代理"),
             query: None,
             selected: 0,
             context: vec![format!(
@@ -979,8 +1087,8 @@ impl App {
             )],
             rows: vec![
                 Row::new(
-                    "Edit address",
-                    "HTTP, HTTPS, or SOCKS5 URL",
+                    locale.text("Edit address", "修改地址"),
+                    locale.text("HTTP, HTTPS, or SOCKS5 URL", "HTTP、HTTPS 或 SOCKS5 地址"),
                     Action::EditProxyUrl,
                 ),
                 Row::new(label, detail, Action::SetProxyEnabled(!proxy.enabled)),
@@ -989,7 +1097,7 @@ impl App {
     }
 
     fn refresh_settings_menu(&mut self) {
-        if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.title == "Settings") {
+        if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.kind == MenuKind::Settings) {
             let old = self.panes.pop();
             self.open_settings();
             if let (Some(Pane::Menu(old)), Some(Pane::Menu(new))) = (old, self.panes.last_mut()) {
@@ -999,31 +1107,81 @@ impl App {
     }
 
     fn open_settings(&mut self) {
+        let locale = self.locale;
         let label = if self.config.settings.device.is_some() {
             self.scan_devices();
-            "Checking saved microphone…"
+            locale.text("Checking saved microphone…", "正在检查所选麦克风…")
         } else {
-            "System default"
+            locale.text("System default", "系统默认")
         };
         self.panes.push(Pane::Menu(Menu {
-            title: "Settings",
+            kind: MenuKind::Settings,
+            title: locale.text("Settings", "设置"),
             query: None,
             context: Vec::new(),
             selected: 0,
             rows: vec![
-                Row::new("Device", label, Action::Devices),
-                Row::new("Provider", "Codex", Action::Provider),
+                Row::new(locale.text("Device", "麦克风"), label, Action::Devices),
                 Row::new(
-                    "Proxy",
+                    locale.text("Codex sign-in", "Codex 登录"),
+                    "",
+                    Action::Provider,
+                ),
+                Row::new(
+                    locale.text("Proxy", "网络代理"),
                     if self.config.settings.proxy.enabled {
-                        "On"
+                        locale.text("On", "已启用")
                     } else {
-                        "Off"
+                        locale.text("Off", "已关闭")
                     },
                     Action::Proxy,
                 ),
+                Row::new(
+                    locale.text("Interface language", "界面语言"),
+                    self.config.settings.language.label(locale),
+                    Action::Language,
+                ),
             ],
         }));
+    }
+
+    fn open_language(&mut self) {
+        let locale = self.locale;
+        let rows = Language::OPTIONS
+            .into_iter()
+            .map(|language| Row::new(language.label(locale), "", Action::SetLanguage(language)))
+            .collect();
+        let selected = Language::OPTIONS
+            .iter()
+            .position(|&language| language == self.config.settings.language)
+            .unwrap_or_default();
+        self.panes.push(Pane::Menu(Menu {
+            kind: MenuKind::Language,
+            title: locale.text("Interface language", "界面语言"),
+            context: vec![locale.language_changed().into()],
+            query: None,
+            rows,
+            selected,
+        }));
+    }
+
+    fn set_language(&mut self, language: Language) {
+        if language == self.config.settings.language {
+            self.panes.pop();
+            return;
+        }
+        let mut settings = self.config.settings.clone();
+        settings.language = language;
+        match self.config.save(settings) {
+            Ok(()) => {
+                self.panes.pop();
+                self.refresh_settings_menu();
+                if let Some(Pane::Menu(menu)) = self.panes.last_mut() {
+                    menu.context.push(self.locale.language_changed().into());
+                }
+            }
+            Err(error) => self.notice = Some(error.restart_message(&self.config)),
+        }
     }
 
     fn open_devices(&mut self) {
@@ -1031,27 +1189,32 @@ impl App {
         self.panes.push(Pane::Menu(Self::device_menu(
             self.config.settings.device.as_deref(),
             None,
+            self.locale,
         )));
     }
 
     fn scan_devices(&mut self) {
         if self.device_scan.is_none() {
             let (send, receive) = mpsc::channel();
+            let locale = self.locale;
             thread::spawn(move || {
-                let _ = send.send(audio::devices());
+                let _ = send.send(audio::devices(locale));
             });
             self.device_scan = Some(receive);
         }
     }
 
     fn poll_devices(&mut self) -> bool {
+        let locale = self.locale;
         let Some(scan) = &self.device_scan else {
             return false;
         };
         let result = match scan.try_recv() {
             Ok(result) => result,
             Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => Err("Could not list microphone inputs.".into()),
+            Err(TryRecvError::Disconnected) => Err(locale
+                .text("Could not list microphone inputs.", "无法获取麦克风列表")
+                .into()),
         };
         self.device_scan = None;
         let saved = self.config.settings.device.as_deref();
@@ -1060,14 +1223,17 @@ impl App {
             let Pane::Menu(menu) = pane else {
                 continue;
             };
-            match menu.title {
-                "Input device" => *menu = Self::device_menu(saved, Some(&result)),
-                "Settings" if saved.is_some() => {
+            match menu.kind {
+                MenuKind::Devices => *menu = Self::device_menu(saved, Some(&result), locale),
+                MenuKind::Settings if saved.is_some() => {
                     menu.rows[0].detail = match &result {
                         Ok(devices) => devices
                             .iter()
                             .find(|device| Some(device.id.as_str()) == saved)
-                            .map_or("Saved microphone unavailable", |device| &device.label)
+                            .map_or(
+                                locale.text("Saved microphone unavailable", "所选麦克风不可用"),
+                                |device| &device.label,
+                            )
                             .into(),
                         Err(error) => error.clone(),
                     };
@@ -1079,8 +1245,12 @@ impl App {
         changed
     }
 
-    fn device_menu(saved: Option<&str>, result: Option<&DeviceList>) -> Menu {
-        let mut rows = vec![Row::new("System default", "", Action::SelectDevice(None))];
+    fn device_menu(saved: Option<&str>, result: Option<&DeviceList>, locale: Locale) -> Menu {
+        let mut rows = vec![Row::new(
+            locale.text("System default", "系统默认"),
+            "",
+            Action::SelectDevice(None),
+        )];
         let mut context = Vec::new();
         let mut selected = 0;
         match result {
@@ -1097,15 +1267,27 @@ impl App {
                 }
             }
             Some(Err(error)) => context.push(error.clone()),
-            None => context.push("Scanning microphones…".into()),
+            None => context.push(
+                locale
+                    .text("Scanning microphones…", "正在搜索麦克风…")
+                    .into(),
+            ),
         }
         if saved.is_none() || selected > 0 {
-            rows[selected].detail = "Current input".into();
+            rows[selected].detail = locale.text("Current input", "当前输入设备").into();
         } else if matches!(result, Some(Ok(_))) {
-            context.push("Saved microphone unavailable. Choose an input.".into());
+            context.push(
+                locale
+                    .text(
+                        "Saved microphone unavailable. Choose an input.",
+                        "所选麦克风不可用，请选择输入设备",
+                    )
+                    .into(),
+            );
         }
         Menu {
-            title: "Input device",
+            kind: MenuKind::Devices,
+            title: locale.text("Input device", "输入设备"),
             rows,
             context,
             query: None,
@@ -1114,12 +1296,17 @@ impl App {
     }
 
     fn open_provider(&mut self) {
-        let mut context = vec!["Codex · ChatGPT subscription".to_owned()];
-        match self.config.settings.auth_file() {
+        let locale = self.locale;
+        let mut context = vec![
+            locale
+                .text("Codex · ChatGPT subscription", "Codex · ChatGPT 订阅")
+                .to_owned(),
+        ];
+        match self.config.settings.auth_file(locale) {
             Ok(path) => {
                 context.push(path.display().to_string());
                 context.push(
-                    login_status(&path)
+                    login_status(&path, locale)
                         .map(str::to_owned)
                         .unwrap_or_else(|error| error),
                 );
@@ -1127,19 +1314,23 @@ impl App {
             Err(error) => context.push(error),
         }
         self.panes.push(Pane::Menu(Menu {
-            title: "Provider",
+            kind: MenuKind::Provider,
+            title: locale.text("Codex sign-in", "Codex 登录"),
             context,
             query: None,
             selected: 0,
             rows: vec![
                 Row::new(
-                    "Set auth file",
-                    "Use an explicit path",
+                    locale.text("Set auth file", "指定登录文件"),
+                    locale.text("Use an explicit path", "手动指定路径"),
                     Action::EditAuthPath,
                 ),
                 Row::new(
-                    "Use automatic path",
-                    "CODEX_HOME or Windows user profile",
+                    locale.text("Use automatic path", "自动查找登录文件"),
+                    locale.text(
+                        "CODEX_HOME or Windows user profile",
+                        "CODEX_HOME 或系统用户目录",
+                    ),
                     Action::ResetAuthPath,
                 ),
             ],
@@ -1147,9 +1338,10 @@ impl App {
     }
 }
 
-fn commands(slash_prompt: bool) -> Menu {
+fn commands(slash_prompt: bool, locale: Locale) -> Menu {
     Menu {
-        title: "Commands",
+        kind: MenuKind::Commands,
+        title: locale.text("Commands", "命令列表"),
         context: Vec::new(),
         query: Some(CommandQuery {
             text: String::new(),
@@ -1157,39 +1349,80 @@ fn commands(slash_prompt: bool) -> Menu {
         }),
         selected: 0,
         rows: vec![
-            Row::new("/clear", "Clear the note", Action::Clear),
+            Row::new(
+                "/clear",
+                locale.text("Clear the note", "清空便笺"),
+                Action::Clear,
+            ),
             Row::new(
                 "/lowercase",
-                "Selection or underline · keep abbreviations",
+                locale.text(
+                    "Selection or underline · keep abbreviations",
+                    "将选中或带下划线的文字转为小写 · 保留缩写",
+                ),
                 Action::Lowercase,
             ),
             Row::new(
                 "/settings",
-                "View device, provider, and proxy settings",
+                locale.text(
+                    "View device, provider, and proxy settings",
+                    "查看麦克风、登录、代理和界面设置",
+                ),
                 Action::Settings,
             ),
-            Row::new("/device", "Choose a microphone", Action::Devices),
+            Row::new(
+                "/device",
+                locale.text("Choose a microphone", "选择麦克风"),
+                Action::Devices,
+            ),
             Row::new(
                 "/provider",
-                "View Codex login and change the auth path",
+                locale.text(
+                    "View Codex login and change the auth path",
+                    "查看 Codex 登录状态和修改登录文件路径",
+                ),
                 Action::Provider,
             ),
-            Row::new("/proxy", "View or edit the proxy address", Action::Proxy),
+            Row::new(
+                "/proxy",
+                locale.text("View or edit the proxy address", "查看或修改代理地址"),
+                Action::Proxy,
+            ),
             Row::new(
                 "/proxyon",
-                "Enable the configured proxy",
+                locale.text("Enable the configured proxy", "启用已配置的代理"),
                 Action::SetProxyEnabled(true),
             ),
             Row::new(
                 "/proxyoff",
-                "Connect directly",
+                locale.text("Connect directly", "直接连接"),
                 Action::SetProxyEnabled(false),
             ),
-            Row::new("/help", "Show keyboard shortcuts", Action::Help),
-            Row::new("/quit", "Return to PowerShell", Action::Quit),
-            Row::new(":q", "Return to PowerShell", Action::Quit),
-            Row::new(":h", "Show keyboard shortcuts", Action::Help),
-            Row::new(":u", "Undo the last edit", Action::Undo),
+            Row::new(
+                "/help",
+                locale.text("Show keyboard shortcuts", "显示键盘快捷键"),
+                Action::Help,
+            ),
+            Row::new(
+                "/quit",
+                locale.text("Return to PowerShell", "返回 PowerShell"),
+                Action::Quit,
+            ),
+            Row::new(
+                ":q",
+                locale.text("Return to PowerShell", "返回 PowerShell"),
+                Action::Quit,
+            ),
+            Row::new(
+                ":h",
+                locale.text("Show keyboard shortcuts", "显示键盘快捷键"),
+                Action::Help,
+            ),
+            Row::new(
+                ":u",
+                locale.text("Undo the last edit", "撤销上一次编辑"),
+                Action::Undo,
+            ),
         ],
     }
 }
@@ -1530,7 +1763,41 @@ mod tests {
             panic!("expected the device menu");
         };
         assert_eq!(devices.context, ["Enumeration failed"]);
-        assert_eq!(devices.rows[0].name, "System default");
+        assert_eq!(
+            devices.rows[0].name,
+            app.locale.text("System default", "系统默认")
+        );
+    }
+
+    #[test]
+    fn language_menu_saves_the_selection_for_the_next_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dflow.toml");
+        let mut app = App::new(Config::load_for(path.clone(), Some(Locale::English)));
+        app.open_settings();
+        app.perform(Action::Language);
+        let Some(Pane::Menu(menu)) = app.panes.last() else {
+            panic!("expected the language menu");
+        };
+        assert_eq!(
+            menu.visible()
+                .iter()
+                .map(|row| row.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Follow system language", "English", "简体中文"]
+        );
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.locale, Locale::English);
+        let mut restarted = App::new(Config::load(path));
+        restarted.open_settings();
+        let Some(Pane::Menu(menu)) = restarted.panes.last() else {
+            panic!("expected the settings menu");
+        };
+        assert_eq!(menu.title, "设置");
+        assert_eq!(menu.rows[3].name, "界面语言");
+        assert_eq!(menu.rows[3].detail, "简体中文");
     }
 
     #[test]

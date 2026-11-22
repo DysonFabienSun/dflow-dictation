@@ -2,6 +2,7 @@ use crate::{
     app::{App, Menu, Pane},
     editor::{caret_position, note_rows},
 };
+use dflow_scratchpad::locale::Locale;
 use ratatui::{
     Frame,
     layout::{Position, Rect},
@@ -19,6 +20,7 @@ const NOTE_SELECTION: Style = Style::new().add_modifier(Modifier::REVERSED);
 const NOTE_UNDERLINE: Style = Style::new().add_modifier(Modifier::UNDERLINED);
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    let locale = app.locale;
     let screen = frame.area();
     app.note_area = Rect::ZERO;
     if screen.is_empty() {
@@ -34,27 +36,44 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut footer = Rect::new(content.x, content.bottom() - 1, content.width, 1);
     let available = content.height.saturating_sub(1);
     let mut panel = match app.panes.last() {
-        Some(Pane::Menu(menu)) => menu_lines(menu, content.width, available.saturating_sub(1)),
+        Some(Pane::Menu(menu)) => {
+            menu_lines(menu, content.width, available.saturating_sub(1), locale)
+        }
         Some(Pane::TextInput { kind, text }) => {
-            let (title, hint) = kind.labels();
+            let (title, hint) = kind.labels(locale);
             vec![
                 Line::styled(title, ACCENT),
                 Line::raw(clip_end(text, content.width as usize).to_owned()),
                 Line::styled(
-                    format!("{hint} · Ctrl+U clear · Enter save · Esc back"),
+                    format!(
+                        "{hint} · {}",
+                        locale.text(
+                            "Ctrl+U clear · Enter save · Esc back",
+                            "Ctrl+U 清空 · Enter 保存 · Esc 返回"
+                        )
+                    ),
                     SECONDARY,
                 ),
             ]
         }
         Some(Pane::Help) => vec![
-            Line::styled("Keyboard shortcuts", ACCENT),
-            Line::raw("Shift+arrows select · Ctrl+A select all"),
-            Line::raw("Ctrl+Shift+←/→ select by word"),
-            Line::raw("Ctrl+Z undo · Ctrl+Y redo"),
-            Line::raw("Ctrl+Space dictate · hold for push-to-talk"),
-            Line::raw("Ctrl+C copy · Ctrl+X cut"),
-            Line::raw("Esc or Ctrl+/ commands · :h help · :u undo · :q quit"),
-            Line::styled("Esc close", SECONDARY),
+            Line::styled(locale.text("Keyboard shortcuts", "键盘快捷键"), ACCENT),
+            Line::raw(locale.text(
+                "Shift+arrows select · Ctrl+A select all",
+                "Shift+方向键 选择 · Ctrl+A 全选",
+            )),
+            Line::raw(locale.text("Ctrl+Shift+←/→ select by word", "Ctrl+Shift+←/→ 按词选择")),
+            Line::raw(locale.text("Ctrl+Z undo · Ctrl+Y redo", "Ctrl+Z 撤销 · Ctrl+Y 重做")),
+            Line::raw(locale.text(
+                "Ctrl+Space dictate · hold for push-to-talk",
+                "Ctrl+Space 听写 · 按住可持续听写",
+            )),
+            Line::raw(locale.text("Ctrl+C copy · Ctrl+X cut", "Ctrl+C 复制 · Ctrl+X 剪切")),
+            Line::raw(locale.text(
+                "Esc or Ctrl+/ commands · :h help · :u undo · :q quit",
+                "Esc 或 Ctrl+/ 命令列表 · :h 帮助 · :u 撤销 · :q 退出",
+            )),
+            Line::styled(locale.text("Esc close", "Esc 关闭"), SECONDARY),
         ],
         None => Vec::new(),
     };
@@ -92,14 +111,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let (status, error) = app.status();
     if let Some(count) = app.copied_characters() {
-        let message = format!("Copied {count} chars");
-        let message = if message.len() <= usize::from(footer.width) {
-            message
-        } else {
-            format!("{count} chars")
-        };
-        let message = clip_start(&message, usize::from(footer.width));
-        let width = message.len() as u16;
+        let (message, width) = copy_status(locale, count, footer.width);
         let right = Rect::new(footer.right() - width, footer.y, width, 1);
         frame.render_widget(
             Paragraph::new(message).style(Style::new().fg(Color::Green)),
@@ -117,6 +129,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
 }
 
+fn copy_status(locale: Locale, count: usize, available: u16) -> (String, u16) {
+    let mut message = match locale {
+        Locale::English => format!("Copied {count} chars"),
+        Locale::SimplifiedChinese => format!("已复制 {count} 个字符"),
+    };
+    if message.width() > usize::from(available) {
+        message = match locale {
+            Locale::English => format!("{count} chars"),
+            Locale::SimplifiedChinese => format!("{count} 字符"),
+        };
+    }
+    let message = clip_start(&message, usize::from(available));
+    (message.to_owned(), message.width() as u16)
+}
+
 fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows = note_rows(app.editor.text(), usize::from(area.width));
     let (cursor_row, cursor_column) = caret_position(&rows, app.editor.cursor());
@@ -127,7 +154,7 @@ fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
         .max(cursor_row.saturating_sub(height - 1));
     if app.editor.text().is_empty() && app.panes.is_empty() {
         frame.render_widget(
-            Paragraph::new("Type or dictate a note.")
+            Paragraph::new(app.locale.text("Type or dictate a note.", "输入或听写便笺"))
                 .style(SECONDARY)
                 .wrap(Wrap { trim: false }),
             area,
@@ -168,7 +195,7 @@ fn draw_note(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn menu_lines(menu: &Menu, width: u16, height: u16) -> Vec<Line<'static>> {
+fn menu_lines(menu: &Menu, width: u16, height: u16, locale: Locale) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
     }
@@ -221,7 +248,10 @@ fn menu_lines(menu: &Menu, width: u16, height: u16) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
     if visible.is_empty() {
-        lines.push(Line::styled("No matching commands", SECONDARY));
+        lines.push(Line::styled(
+            locale.text("No matching commands", "没有匹配的命令"),
+            SECONDARY,
+        ));
     }
     if narrow
         && let Some(row) = visible.get(menu.selected)
@@ -253,4 +283,51 @@ fn clip_end(text: &str, cells: usize) -> &str {
         }
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn chinese_footer_and_copy_message_use_display_cells() {
+        let locale = Locale::SimplifiedChinese;
+        assert_eq!(copy_status(locale, 8, 20), ("已复制 8 个字符".into(), 15));
+        assert_eq!(copy_status(locale, 8, 6), ("8 字符".into(), 6));
+        assert_eq!(copy_status(locale, 8, 5), ("8 字".into(), 4));
+    }
+
+    #[test]
+    fn chinese_help_preserves_the_note_in_a_narrow_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config::load_for(
+            directory.path().join("dflow.toml"),
+            Some(Locale::SimplifiedChinese),
+        );
+        let mut app = App::new(config);
+        app.editor.insert("便笺内容");
+        app.event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        for key in "/help".chars().map(KeyCode::Char).chain([KeyCode::Enter]) {
+            app.event(Event::Key(KeyEvent::new(key, KeyModifiers::NONE)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(28, 9)).unwrap();
+        let frame = terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let rows: Vec<String> = frame
+            .buffer
+            .content
+            .chunks(28)
+            .map(|row| {
+                row.iter()
+                    .filter(|cell| cell.symbol() != " ")
+                    .map(|cell| cell.symbol())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(rows[0], "便笺内容");
+        assert!(rows.iter().any(|row| row == "键盘快捷键"));
+        assert!(!app.note_area.is_empty());
+    }
 }

@@ -1,4 +1,7 @@
-use crate::hotkey::Hotkey;
+use crate::{
+    hotkey::Hotkey,
+    locale::{Language, Locale},
+};
 use std::{
     env,
     fs::{self, File},
@@ -9,6 +12,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 #[derive(Clone)]
 pub struct Settings {
+    pub language: Language,
     pub device: Option<String>,
     pub hold_delay_ms: u32,
     pub auth_path: Option<PathBuf>,
@@ -32,6 +36,7 @@ fn settings_path_for(executable: &Path) -> std::io::Result<PathBuf> {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language: Language::Auto,
             device: None,
             hold_delay_ms: DEFAULT_HOLD_DELAY_MS,
             auth_path: None,
@@ -55,14 +60,21 @@ impl Default for ProxySettings {
     }
 }
 
-pub fn parse_proxy_url(input: &str) -> Result<reqwest::Url, String> {
+pub fn parse_proxy_url(input: &str, locale: Locale) -> Result<reqwest::Url, String> {
     let input = input.trim();
-    let invalid =
-        "Enter an http://, https://, or socks5:// proxy URL with a host and optional port.";
+    let invalid = locale.text(
+        "Enter an http://, https://, or socks5:// proxy URL with a host and optional port.",
+        "请输入以 http://、https:// 或 socks5:// 开头的代理地址，须包含主机名，可指定端口",
+    );
     let (_, address) = input.split_once("://").ok_or(invalid)?;
     let authority = address.split('/').next().unwrap_or_default();
     if authority.contains('@') {
-        return Err("Proxy URLs must not include usernames or passwords.".into());
+        return Err(locale
+            .text(
+                "Proxy URLs must not include usernames or passwords.",
+                "代理地址不能包含用户名或密码",
+            )
+            .into());
     }
     if authority.is_empty()
         || input
@@ -85,7 +97,7 @@ pub fn parse_proxy_url(input: &str) -> Result<reqwest::Url, String> {
 }
 
 impl Settings {
-    pub fn auth_file(&self) -> Result<PathBuf, String> {
+    pub fn auth_file(&self, locale: Locale) -> Result<PathBuf, String> {
         if let Some(path) = &self.auth_path {
             return Ok(path.clone());
         }
@@ -95,7 +107,14 @@ impl Settings {
         env::var_os("USERPROFILE")
             .filter(|s| !s.is_empty())
             .map(|home| PathBuf::from(home).join(".codex").join("auth.json"))
-            .ok_or_else(|| "Set the Codex auth file in /provider.".into())
+            .ok_or_else(|| {
+                locale
+                    .text(
+                        "Set the Codex auth file in Settings.",
+                        "请在设置中指定 Codex 登录文件",
+                    )
+                    .into()
+            })
     }
 }
 
@@ -103,8 +122,32 @@ pub struct Config {
     pub path: PathBuf,
     pub settings: Settings,
     pub error: Option<String>,
+    pub locale: Locale,
     document: DocumentMut,
     original: Option<String>,
+}
+
+#[derive(Debug)]
+pub enum SaveError {
+    ChangedOnDisk,
+    Message(String),
+}
+
+impl SaveError {
+    pub fn restart_message(self, config: &Config) -> String {
+        match self {
+            Self::ChangedOnDisk => {
+                let path = config.path.display();
+                match config.locale {
+                    Locale::English => {
+                        format!("{path} changed on disk. Restart DFlow before saving.")
+                    }
+                    Locale::SimplifiedChinese => format!("{path} 已被修改，请重启 DFlow 后再保存"),
+                }
+            }
+            Self::Message(message) => message,
+        }
+    }
 }
 
 fn read_config(path: &Path) -> std::io::Result<Option<String>> {
@@ -117,46 +160,82 @@ fn read_config(path: &Path) -> std::io::Result<Option<String>> {
 
 impl Config {
     pub fn load(path: PathBuf) -> Self {
-        let loaded = read_config(&path)
-            .map_err(|error| error.to_string())
-            .and_then(|original| {
-                let (document, settings) = parse(original.as_deref().unwrap_or_default())?;
-                Ok((document, settings, original))
-            });
+        Self::load_for(path, None)
+    }
+
+    pub fn load_for(path: PathBuf, active_locale: Option<Locale>) -> Self {
+        let mut locale = active_locale;
+        let loaded: Result<_, String> = (|| {
+            let original = read_config(&path).map_err(|error| error.to_string())?;
+            let document = original
+                .as_deref()
+                .unwrap_or_default()
+                .parse::<DocumentMut>()
+                .map_err(|error| error.message().to_owned())?;
+            let language = read_language(&document).ok_or_else(|| {
+                locale
+                    .get_or_insert_with(Locale::system)
+                    .text(
+                        "ui.language must be auto, en, or zh-CN.",
+                        "ui.language 必须是 auto、en 或 zh-CN",
+                    )
+                    .to_owned()
+            })?;
+            let locale = *locale.get_or_insert_with(|| language.resolve(Locale::system));
+            let settings = parse_settings(&document, language, locale)?;
+            Ok((document, settings, original))
+        })();
+        let locale = locale.unwrap_or_else(Locale::system);
         match loaded {
             Ok((document, settings, original)) => Self {
                 path,
                 settings,
                 error: None,
+                locale,
                 document,
                 original,
             },
             Err(error) => Self {
-                error: Some(format!("{}: {error}", path.display())),
+                error: Some(format!(
+                    "{} · {}: {error}",
+                    locale.text("Could not load settings", "无法加载设置"),
+                    path.display()
+                )),
                 path,
                 settings: Settings::default(),
+                locale,
                 document: DocumentMut::new(),
                 original: None,
             },
         }
     }
 
-    pub fn save(&mut self, settings: Settings) -> Result<(), String> {
+    pub fn save(&mut self, settings: Settings) -> Result<(), SaveError> {
         self.save_with_tray(settings, None)
     }
 
     pub fn tray_hotkey(&self) -> Result<Hotkey, String> {
-        string(table(&self.document, "tray")?, "hotkey")?
-            .map(|text| text.parse().map_err(str::to_owned))
-            .unwrap_or_else(|| Ok(Hotkey::default()))
+        string(
+            table(&self.document, "tray", self.locale)?,
+            "hotkey",
+            self.locale,
+        )?
+        .map(|text| Hotkey::parse_localized(text, self.locale))
+        .unwrap_or_else(|| Ok(Hotkey::default()))
     }
 
     pub fn tray_launch_preview(&self) -> Result<bool, String> {
-        table(&self.document, "tray")?
+        table(&self.document, "tray", self.locale)?
             .and_then(|table| table.get("show_launch_preview"))
             .map(|item| {
-                item.as_bool()
-                    .ok_or_else(|| "tray.show_launch_preview must be true or false.".into())
+                item.as_bool().ok_or_else(|| {
+                    self.locale
+                        .text(
+                            "tray.show_launch_preview must be true or false.",
+                            "tray.show_launch_preview 必须是 true 或 false",
+                        )
+                        .into()
+                })
             })
             .unwrap_or(Ok(true))
     }
@@ -166,7 +245,7 @@ impl Config {
         settings: Settings,
         hotkey: Hotkey,
         show_launch_preview: bool,
-    ) -> Result<(), String> {
+    ) -> Result<(), SaveError> {
         self.save_with_tray(settings, Some((hotkey, show_launch_preview)))
     }
 
@@ -174,19 +253,27 @@ impl Config {
         &mut self,
         settings: Settings,
         tray: Option<(Hotkey, bool)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SaveError> {
+        let locale = self.locale;
+        let path = self.path.display();
         if self.error.is_some() {
-            return Err(format!(
-                "Correct {} and restart DFlow before saving.",
-                self.path.display()
-            ));
+            return Err(SaveError::Message(match locale {
+                Locale::English => format!("Correct {path} and restart DFlow before saving."),
+                Locale::SimplifiedChinese => format!("请修正 {path} 并重启 DFlow 后再保存"),
+            }));
         }
         let mut document = self.document.clone();
         if let Some((hotkey, show_launch_preview)) = tray {
-            table(&document, "tray")?;
+            table(&document, "tray", locale).map_err(SaveError::Message)?;
             set_optional(&mut document, "tray", "hotkey", Some(&hotkey.to_string()));
             document["tray"]["show_launch_preview"] = value(show_launch_preview);
         }
+        set_optional(
+            &mut document,
+            "ui",
+            "language",
+            settings.language.config_value(),
+        );
         set_optional(
             &mut document,
             "audio",
@@ -205,7 +292,13 @@ impl Config {
         document["proxy"]["enabled"] = value(settings.proxy.enabled);
 
         let text = document.to_string();
-        let parent = self.path.parent().ok_or("Missing config directory.")?;
+        let parent = self.path.parent().ok_or_else(|| {
+            SaveError::Message(
+                locale
+                    .text("Missing config directory.", "找不到配置目录")
+                    .into(),
+            )
+        })?;
         let save = || -> std::io::Result<bool> {
             fs::create_dir_all(parent)?;
             // Lock a stable path since persisting the temporary file replaces the TOML file.
@@ -225,11 +318,13 @@ impl Config {
             temp.persist(&self.path).map_err(|error| error.error)?;
             Ok(true)
         };
-        if !save().map_err(|e| format!("Could not save {}: {e}", self.path.display()))? {
-            return Err(format!(
-                "{} changed on disk. Restart DFlow before saving.",
-                self.path.display()
-            ));
+        if !save().map_err(|error| {
+            SaveError::Message(match locale {
+                Locale::English => format!("Could not save {path}: {error}"),
+                Locale::SimplifiedChinese => format!("无法保存 {path}：{error}"),
+            })
+        })? {
+            return Err(SaveError::ChangedOnDisk);
         }
         self.document = document;
         self.original = Some(text);
@@ -238,34 +333,62 @@ impl Config {
     }
 }
 
-fn parse(text: &str) -> Result<(DocumentMut, Settings), String> {
-    let document = text
-        .parse::<DocumentMut>()
-        .map_err(|error| error.message().to_owned())?;
-    let audio = table(&document, "audio")?;
-    let transcription = table(&document, "transcription")?;
-    let proxy = table(&document, "proxy")?;
-    if string(transcription, "provider")?.is_some_and(|provider| provider != "codex") {
-        return Err("transcription.provider must be codex.".into());
+fn read_language(document: &DocumentMut) -> Option<Language> {
+    let Some(ui) = document.get("ui") else {
+        return Some(Language::Auto);
+    };
+    match ui.as_table_like()?.get("language") {
+        None => Some(Language::Auto),
+        Some(item) => Language::from_config(item.as_str()?),
+    }
+}
+
+fn parse_settings(
+    document: &DocumentMut,
+    language: Language,
+    locale: Locale,
+) -> Result<Settings, String> {
+    let audio = table(document, "audio", locale)?;
+    let transcription = table(document, "transcription", locale)?;
+    let proxy = table(document, "proxy", locale)?;
+    if string(transcription, "provider", locale)?.is_some_and(|provider| provider != "codex") {
+        return Err(locale
+            .text(
+                "transcription.provider must be codex.",
+                "transcription.provider 必须是 codex",
+            )
+            .into());
     }
     let settings = Settings {
-        device: string(audio, "device_id")?.map(str::to_owned),
+        language,
+        device: string(audio, "device_id", locale)?.map(str::to_owned),
         hold_delay_ms: audio
             .and_then(|table| table.get("hold_delay_ms"))
             .map(|item| {
                 item.as_integer()
                     .and_then(|value| u32::try_from(value).ok())
                     .filter(|value| *value > 0)
-                    .ok_or("audio.hold_delay_ms must be a positive integer in milliseconds.")
+                    .ok_or(locale.text(
+                        "audio.hold_delay_ms must be a positive integer in milliseconds.",
+                        "audio.hold_delay_ms 必须是正整数，单位为毫秒",
+                    ))
             })
             .transpose()?
             .unwrap_or(DEFAULT_HOLD_DELAY_MS),
-        auth_path: string(transcription, "codex_auth_path")?.map(PathBuf::from),
+        auth_path: string(transcription, "codex_auth_path", locale)?.map(PathBuf::from),
         proxy: ProxySettings {
-            url: parse_proxy_url(string(proxy, "url")?.unwrap_or(DEFAULT_PROXY))?,
+            url: parse_proxy_url(
+                string(proxy, "url", locale)?.unwrap_or(DEFAULT_PROXY),
+                locale,
+            )?,
             enabled: proxy
                 .and_then(|table| table.get("enabled"))
-                .map(|item| item.as_bool().ok_or("proxy.enabled must be true or false."))
+                .map(|item| {
+                    item.as_bool().ok_or(locale.text(
+                        "proxy.enabled must be true or false.",
+                        "proxy.enabled 必须是 true 或 false",
+                    ))
+                })
                 .transpose()?
                 .unwrap_or(false),
         },
@@ -275,19 +398,27 @@ fn parse(text: &str) -> Result<(DocumentMut, Settings), String> {
         .as_ref()
         .is_some_and(|path| !path.is_absolute())
     {
-        return Err("transcription.codex_auth_path must be an absolute path.".into());
+        return Err(locale
+            .text(
+                "transcription.codex_auth_path must be an absolute path.",
+                "transcription.codex_auth_path 必须是绝对路径",
+            )
+            .into());
     }
-    Ok((document, settings))
+    Ok(settings)
 }
 
 fn table<'a>(
     doc: &'a DocumentMut,
     key: &str,
+    locale: Locale,
 ) -> Result<Option<&'a dyn toml_edit::TableLike>, String> {
     doc.get(key)
         .map(|item| {
-            item.as_table_like()
-                .ok_or_else(|| format!("{key} must be a table."))
+            item.as_table_like().ok_or_else(|| match locale {
+                Locale::English => format!("{key} must be a table."),
+                Locale::SimplifiedChinese => format!("{key} 必须是 TOML 表"),
+            })
         })
         .transpose()
 }
@@ -295,13 +426,17 @@ fn table<'a>(
 fn string<'a>(
     table: Option<&'a dyn toml_edit::TableLike>,
     key: &str,
+    locale: Locale,
 ) -> Result<Option<&'a str>, String> {
     table
         .and_then(|t| t.get(key))
         .map(|item| {
             item.as_str()
                 .filter(|text| !text.trim().is_empty())
-                .ok_or_else(|| format!("{key} must be a nonempty string."))
+                .ok_or_else(|| match locale {
+                    Locale::English => format!("{key} must be a nonempty string."),
+                    Locale::SimplifiedChinese => format!("{key} 必须是非空字符串"),
+                })
         })
         .transpose()
 }
@@ -363,7 +498,7 @@ mod tests {
                 device: Some("wasapi:sample".into()),
                 hold_delay_ms: 250,
                 proxy: ProxySettings {
-                    url: parse_proxy_url("socks5://localhost:1080").unwrap(),
+                    url: parse_proxy_url("socks5://localhost:1080", Locale::English).unwrap(),
                     enabled: true,
                 },
                 ..Settings::default()
@@ -396,7 +531,7 @@ mod tests {
             "https://proxy.example",
             "socks5://[::1]:1080",
         ] {
-            assert!(parse_proxy_url(url).is_ok(), "{url}");
+            assert!(parse_proxy_url(url, Locale::English).is_ok(), "{url}");
         }
         for url in [
             "http://user@host:80",
@@ -407,7 +542,7 @@ mod tests {
             "http://host?token=x",
             "ftp://host",
         ] {
-            assert!(parse_proxy_url(url).is_err(), "{url}");
+            assert!(parse_proxy_url(url, Locale::English).is_err(), "{url}");
         }
     }
 
@@ -425,5 +560,64 @@ mod tests {
         assert!(first.save(Settings::default()).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), edited);
         assert!(!first.settings.proxy.enabled);
+    }
+
+    #[test]
+    fn language_preference_round_trips_between_apps_and_applies_on_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dflow.toml");
+        fs::write(&path, "[ui]\nextra = 7\n").unwrap();
+        let mut scratchpad = Config::load_for(path.clone(), Some(Locale::English));
+        let mut tray = Config::load_for(path.clone(), Some(Locale::English));
+        assert_eq!(scratchpad.settings.language, Language::Auto);
+        let chinese = Settings {
+            language: Language::SimplifiedChinese,
+            ..scratchpad.settings.clone()
+        };
+        scratchpad.save(chinese).unwrap();
+        assert_eq!(scratchpad.locale, Locale::English);
+        assert!(matches!(
+            tray.save(tray.settings.clone()),
+            Err(SaveError::ChangedOnDisk)
+        ));
+
+        let mut tray = Config::load(path.clone());
+        assert_eq!(tray.locale, Locale::SimplifiedChinese);
+        let english = Settings {
+            language: Language::English,
+            ..tray.settings.clone()
+        };
+        tray.save_tray(english, Hotkey::default(), true).unwrap();
+        assert_eq!(tray.locale, Locale::SimplifiedChinese);
+        let mut scratchpad = Config::load(path.clone());
+        assert_eq!(scratchpad.locale, Locale::English);
+        let automatic = Settings {
+            language: Language::Auto,
+            ..scratchpad.settings.clone()
+        };
+        scratchpad.save(automatic).unwrap();
+        assert_eq!(Config::load(path.clone()).settings.language, Language::Auto);
+        assert!(fs::read_to_string(&path).unwrap().contains("extra = 7"));
+
+        fs::write(&path, "[ui]\nlanguage = \"auto\"\n").unwrap();
+        assert_eq!(Config::load(path).locale, Locale::system());
+    }
+
+    #[test]
+    fn invalid_language_preferences_preserve_the_settings_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dflow.toml");
+        for original in [
+            "[ui]\nlanguage = \"zh-TW\"\n",
+            "[ui]\nlanguage = true\n",
+            "[ui\n",
+        ] {
+            fs::write(&path, original).unwrap();
+            let mut config = Config::load_for(path.clone(), Some(Locale::SimplifiedChinese));
+            assert!(config.error.as_deref().unwrap().contains("无法加载设置"));
+            assert_eq!(config.settings.language, Language::Auto);
+            assert!(config.save(Settings::default()).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        }
     }
 }

@@ -2,8 +2,9 @@ use crate::settings;
 use dflow_scratchpad::{
     audio::{Session, Update},
     clipboard::{Clipboard, ClipboardFeedback},
-    config::{self, Config},
+    config::Config,
     hotkey::Hotkey,
+    locale::Locale,
 };
 use std::{
     cell::Cell,
@@ -62,11 +63,14 @@ pub struct Binding {
 }
 
 impl Binding {
-    pub fn register(hwnd: HWND, hotkey: Hotkey, id: i32) -> Result<Self, String> {
+    pub fn register(hwnd: HWND, hotkey: Hotkey, id: i32, locale: Locale) -> Result<Self, String> {
         if unsafe { RegisterHotKey(hwnd, id, hotkey.modifiers | MOD_NOREPEAT, hotkey.key) } == 0 {
-            return Err(format!(
-                "Could not register {hotkey}. Choose another shortcut in Settings."
-            ));
+            return Err(match locale {
+                Locale::English => {
+                    format!("Could not register {hotkey}. Choose another shortcut in Settings.")
+                }
+                Locale::SimplifiedChinese => format!("无法注册 {hotkey}，请在设置中选择其他快捷键"),
+            });
         }
         Ok(Self { id, hotkey })
     }
@@ -104,14 +108,14 @@ impl PreviewBadge {
         }
     }
 
-    fn label(self, hotkey: Option<Hotkey>) -> String {
+    fn label(self, hotkey: Option<Hotkey>, locale: Locale) -> String {
         let label = match self {
-            Self::Cancel => "CANCEL",
-            Self::Stop | Self::StopPending => "STOP & COPY",
-            Self::Dismiss => "DISMISS",
-            Self::Transcribing | Self::Copying => "Finishing…",
-            Self::Copied => "Copied",
-            Self::CopyFailed => "Copy failed",
+            Self::Cancel => locale.text("CANCEL", "取消"),
+            Self::Stop | Self::StopPending => locale.text("STOP & COPY", "停止并复制"),
+            Self::Dismiss => locale.text("DISMISS", "关闭提示"),
+            Self::Transcribing | Self::Copying => locale.text("Finishing…", "正在完成转写…"),
+            Self::Copied => locale.text("Copied", "已复制"),
+            Self::CopyFailed => locale.text("Copy failed", "复制失败"),
         };
         match hotkey {
             Some(hotkey)
@@ -171,23 +175,34 @@ impl Recording {
         }
     }
 
-    fn status(&self) -> String {
+    fn status(&self, locale: Locale) -> String {
         if self.previewing() {
             return self.transcript.clone();
         }
         let activity = if self.finishing {
-            "Transcribing…"
+            locale.text("Transcribing…", "正在转写…")
         } else if self.quiet {
-            "Listening… microphone is quiet"
+            locale.text(
+                "Listening… microphone is quiet",
+                "正在录音… · 麦克风输入音量较低",
+            )
         } else if self.listening {
-            "Listening…"
+            locale.text("Listening…", "正在录音…")
         } else {
-            "Starting microphone…"
+            locale.text("Starting microphone…", "正在启动麦克风…")
         };
         if !self.can_stop {
-            format!("{activity} · Stop now to discard")
+            format!(
+                "{activity} · {}",
+                locale.text("Stop now to discard", "此时停止将丢弃录音")
+            )
         } else if !self.finishing && self.listening && !self.quiet {
-            "Listening… · Waiting for transcript".into()
+            locale
+                .text(
+                    "Listening… · Waiting for transcript",
+                    "正在录音… · 等待转写结果",
+                )
+                .into()
         } else {
             activity.into()
         }
@@ -230,6 +245,7 @@ fn transcript_preview(text: &str, mut fits: impl FnMut(&str) -> bool) -> String 
 }
 
 struct App {
+    locale: Locale,
     hwnd: HWND,
     pill: HWND,
     preview_shortcut: HWND,
@@ -255,12 +271,12 @@ pub fn instance() -> HINSTANCE {
     unsafe { GetModuleHandleW(null()) }
 }
 
-pub fn message(owner: HWND, text: &str) {
+pub fn message(owner: HWND, text: &str, locale: Locale) {
     unsafe {
         MessageBoxW(
             owner,
             wide(text).as_ptr(),
-            wide("DFlow Dictation").as_ptr(),
+            wide(locale.dictation_name()).as_ptr(),
             MB_OK | MB_ICONWARNING,
         );
     }
@@ -311,7 +327,8 @@ fn last_error() -> String {
     io::Error::last_os_error().to_string()
 }
 
-pub fn run() -> Result<(), String> {
+pub fn run(config: Config) -> Result<(), String> {
+    let locale = config.locale;
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
@@ -324,7 +341,6 @@ pub fn run() -> Result<(), String> {
     if error == ERROR_ALREADY_EXISTS {
         return Ok(());
     }
-    let path = config::settings_path().map_err(|e| e.to_string())?;
     let class = wide("DFlowTrayWindow");
     let icon_resource = 1usize as *const u16;
     let icon = unsafe { LoadIconW(instance(), icon_resource) };
@@ -343,7 +359,7 @@ pub fn run() -> Result<(), String> {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class.as_ptr(),
-            wide("DFlow Dictation").as_ptr(),
+            wide(locale.dictation_name()).as_ptr(),
             WS_POPUP,
             0,
             0,
@@ -368,11 +384,12 @@ pub fn run() -> Result<(), String> {
     }
     TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) });
     let mut app = App {
+        locale,
         hwnd,
         pill,
         preview_shortcut: create_preview_shortcut(pill),
         pill_font: None,
-        path,
+        path: config.path.clone(),
         binding: None,
         recording: None,
         last_transcript: None,
@@ -396,16 +413,20 @@ pub fn run() -> Result<(), String> {
             ..Default::default()
         },
     };
-    let config = Config::load(app.path.clone());
     let binding = config
         .tray_hotkey()
-        .and_then(|hotkey| Binding::register(hwnd, hotkey, 1));
+        .and_then(|hotkey| Binding::register(hwnd, hotkey, 1, locale));
     match binding {
         Ok(binding) => app.binding = Some(binding),
         Err(error) => app.notice(&error),
     }
     if !app.add_icon() {
-        return Err("Could not add the DFlow notification icon.".into());
+        return Err(locale
+            .text(
+                "Could not add the DFlow notification icon.",
+                "无法添加 DFlow 托盘图标",
+            )
+            .into());
     }
     if let Some(error) = config.error.as_deref() {
         app.notice(error);
@@ -627,11 +648,11 @@ fn draw_pill(hwnd: HWND, dc: HDC) {
             let height = line_height(dc, dpi);
             let block = preview_text_height(rows.clone().count() as i32, height, dpi);
             area.top += (area.bottom - area.top - block).max(0) / 2;
-            let welcome = GetWindowLongPtrW(hwnd, PILL_WELCOME_SLOT) != 0;
+            let prefix = GetWindowLongPtrW(hwnd, PILL_WELCOME_SLOT) as usize;
             for (index, row) in rows.enumerate() {
                 let row = row.strip_suffix(&[b'\r' as u16]).unwrap_or(row);
                 area.bottom = area.top + height;
-                if !(welcome && index == 0 && draw_welcome_title(dc, row, area, dpi)) {
+                if !(prefix > 0 && index == 0 && draw_welcome_title(dc, row, area, dpi, prefix)) {
                     DrawTextW(
                         dc,
                         row.as_ptr(),
@@ -661,8 +682,11 @@ fn draw_pill(hwnd: HWND, dc: HDC) {
     }
 }
 
-fn draw_welcome_title(dc: HDC, row: &[u16], area: RECT, dpi: i32) -> bool {
-    let prefix = "Welcome to ".encode_utf16().count();
+fn welcome_prefix(locale: Locale) -> &'static str {
+    locale.text("Welcome to ", "欢迎使用 ")
+}
+
+fn draw_welcome_title(dc: HDC, row: &[u16], area: RECT, dpi: i32, prefix: usize) -> bool {
     if row.len() <= prefix {
         return false;
     }
@@ -848,9 +872,21 @@ impl App {
 
     fn set_tooltip(&mut self) {
         let label = if let Some(binding) = self.binding {
-            format!("DFlow Dictation · {} to start or finish", binding.hotkey)
+            match self.locale {
+                Locale::English => {
+                    format!("DFlow Dictation · {} to start or finish", binding.hotkey)
+                }
+                Locale::SimplifiedChinese => {
+                    format!("DFlow 听写 · {} 开始或结束听写", binding.hotkey)
+                }
+            }
         } else {
-            "DFlow Dictation · Shortcut unavailable · Open Settings".into()
+            self.locale
+                .text(
+                    "DFlow Dictation · Shortcut unavailable · Open Settings",
+                    "DFlow 听写 · 快捷键不可用 · 请打开设置",
+                )
+                .into()
         };
         self.icon.szTip.fill(0);
         for (slot, unit) in self.icon.szTip.iter_mut().zip(label.encode_utf16()) {
@@ -870,13 +906,13 @@ impl App {
         } else {
             self.hide();
             self.recording_id += 1;
-            let config = Config::load(self.path.clone());
+            let config = Config::load_for(self.path.clone(), Some(self.locale));
             if let Some(error) = config.error {
                 self.notice(&error);
                 return;
             }
             self.recording = Some(Recording {
-                session: Session::start(config.settings),
+                session: Session::start(config.settings, self.locale),
                 started_at: Instant::now(),
                 can_stop: false,
                 listening: false,
@@ -890,7 +926,18 @@ impl App {
 
     fn show_launch_preview(&mut self, hotkey: Hotkey) {
         self.indicator(
-            &format!("Welcome to DFlow Dictation!\nPress {hotkey} to dictate. Press again to copy your transcript."),
+            &format!(
+                "{}{}{}\n{}",
+                welcome_prefix(self.locale),
+                self.locale.dictation_name(),
+                self.locale.text("!", ""),
+                match self.locale {
+                    Locale::English =>
+                        format!("Press {hotkey} to dictate. Press again to copy your transcript."),
+                    Locale::SimplifiedChinese =>
+                        format!("按 {hotkey} 开始听写，再按一次停止并复制"),
+                },
+            ),
             Some(PreviewBadge::Dismiss),
         );
         self.status_until = Some(Instant::now() + LAUNCH_PREVIEW_TIME);
@@ -954,7 +1001,10 @@ impl App {
                 Ok(Update::Done) => {
                     let recording = self.recording.take().unwrap();
                     if recording.transcript.trim().is_empty() {
-                        self.notice_for("No speech detected.", Duration::from_secs(1));
+                        self.notice_for(
+                            self.locale.text("No speech detected.", "未检测到语音"),
+                            Duration::from_secs(1),
+                        );
                     } else {
                         self.completed_preview = Some(PreviewBadge::Copying);
                         self.indicator(&recording.transcript, self.completed_preview);
@@ -974,7 +1024,10 @@ impl App {
                     }
                 }
                 Ok(Update::Failed(error)) => self.fail(&error),
-                Err(TryRecvError::Disconnected) => self.fail("Dictation ended unexpectedly."),
+                Err(TryRecvError::Disconnected) => self.fail(
+                    self.locale
+                        .text("Dictation ended unexpectedly.", "听写意外中断"),
+                ),
                 Err(TryRecvError::Empty) => break,
             }
         }
@@ -1038,9 +1091,10 @@ impl App {
             return;
         }
         self.notice(if copied {
-            "Transcript copied."
+            self.locale.text("Transcript copied.", "已复制转写结果")
         } else {
-            "Could not copy the transcript."
+            self.locale
+                .text("Could not copy the transcript.", "无法复制转写结果")
         });
     }
 
@@ -1051,9 +1105,11 @@ impl App {
             .filter(|recording| !recording.transcript.trim().is_empty())
         {
             self.last_transcript = Some(recording.transcript);
-            self.notice(&format!(
-                "{error}\nPartial transcript available from the tray menu."
-            ));
+            let hint = self.locale.text(
+                "Partial transcript available from the tray menu.",
+                "已转写的内容可从托盘菜单复制",
+            );
+            self.notice(&format!("{error}\n{hint}"));
         } else {
             self.notice(error);
         }
@@ -1065,14 +1121,22 @@ impl App {
             return;
         }
         for (id, label, enabled) in [
-            (SETTINGS, "Settings", self.recording.is_none()),
-            (CANCEL, "Cancel recording", self.recording.is_some()),
+            (
+                SETTINGS,
+                self.locale.text("Settings", "设置"),
+                self.recording.is_none(),
+            ),
+            (
+                CANCEL,
+                self.locale.text("Cancel recording", "取消录音"),
+                self.recording.is_some(),
+            ),
             (
                 COPY,
-                "Copy last transcript",
+                self.locale.text("Copy last transcript", "复制上次转写结果"),
                 self.last_transcript.is_some() && self.copies_pending.is_empty(),
             ),
-            (EXIT, "Exit", true),
+            (EXIT, self.locale.text("Exit", "退出"), true),
         ] {
             unsafe {
                 AppendMenuW(
@@ -1111,7 +1175,7 @@ impl App {
                 {
                     self.hide();
                 }
-                settings::open(self.hwnd, &self.path, &mut self.binding);
+                settings::open(self.hwnd, &self.path, &mut self.binding, self.locale);
                 self.set_tooltip();
                 unsafe {
                     Shell_NotifyIconW(NIM_MODIFY, &self.icon);
@@ -1214,7 +1278,11 @@ impl App {
             SetWindowLongPtrW(
                 self.pill,
                 PILL_WELCOME_SLOT,
-                isize::from(badge == Some(PreviewBadge::Dismiss)),
+                if badge == Some(PreviewBadge::Dismiss) {
+                    welcome_prefix(self.locale).encode_utf16().count() as isize
+                } else {
+                    0
+                },
             );
             SetWindowTextW(self.pill, wide(text).as_ptr());
             SetWindowPos(
@@ -1240,11 +1308,11 @@ impl App {
             return;
         };
         let hotkey = self.binding.map(|binding| binding.hotkey);
-        let label = wide(&badge.label(hotkey));
+        let label = wide(&badge.label(hotkey, self.locale));
         let sizing_label = if badge == PreviewBadge::Dismiss {
             label.clone()
         } else {
-            wide(&PreviewBadge::Stop.label(hotkey))
+            wide(&PreviewBadge::Stop.label(hotkey, self.locale))
         };
         let height = SHORTCUT_HEIGHT * dpi / 96;
         let mut length = SIZE {
@@ -1314,7 +1382,7 @@ impl App {
     fn recording_status(&mut self) {
         if let Some(recording) = &self.recording {
             self.indicator(
-                &recording.status(),
+                &recording.status(self.locale),
                 recording.previewing().then(|| recording.preview_badge()),
             );
         }
@@ -1653,6 +1721,7 @@ mod tests {
             let (clipboard, _writes, _feedback) = Clipboard::test_sink();
             let hotkey = "Ctrl+Shift+F2".parse().unwrap();
             let mut app = App {
+                locale: Locale::English,
                 hwnd: parent,
                 pill,
                 preview_shortcut: shortcut,
@@ -1728,6 +1797,30 @@ mod tests {
                 app.indicator(&long_text, Some(badge));
                 assert_eq!(GetWindowLongPtrW(shortcut, GWLP_USERDATA), badge as isize);
             }
+
+            app.locale = Locale::SimplifiedChinese;
+            app.show_launch_preview(hotkey);
+            let length = GetWindowTextW(pill, title.as_mut_ptr(), title.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&title[..length as usize]),
+                "欢迎使用 DFlow 听写\r\n按 Ctrl+Shift+F2 开始听写，再按一次停止并复制"
+            );
+            assert_eq!(
+                GetWindowLongPtrW(pill, PILL_WELCOME_SLOT),
+                "欢迎使用 ".encode_utf16().count() as isize
+            );
+            let mut widths = Vec::new();
+            for dpi in [96, 144] {
+                app.show_preview_shortcut(Some(PreviewBadge::Stop), 560, 100, dpi);
+                let length = GetWindowTextW(shortcut, title.as_mut_ptr(), title.len() as i32);
+                assert_eq!(
+                    String::from_utf16_lossy(&title[..length as usize]),
+                    "停止并复制 · CTRL+SHIFT+F2"
+                );
+                assert_ne!(GetWindowRect(shortcut, &mut area), 0);
+                widths.push(area.right - area.left);
+            }
+            assert!(widths[0] > 0 && widths[1] > widths[0]);
         }
     }
 
@@ -1755,27 +1848,38 @@ mod tests {
             finishing: false,
             transcript: String::new(),
         };
-        assert_eq!(recording.status(), "Listening… · Stop now to discard");
+        assert_eq!(
+            recording.status(Locale::English),
+            "Listening… · Stop now to discard"
+        );
         recording.transcript = "Meet Wednesday.".into();
         assert!(recording.previewing());
-        assert_eq!(recording.status(), "Meet Wednesday.");
+        assert_eq!(recording.status(Locale::English), "Meet Wednesday.");
         assert_eq!(
-            recording.preview_badge().label(Some(Hotkey::default())),
+            recording
+                .preview_badge()
+                .label(Some(Hotkey::default()), Locale::English),
             "CANCEL · CTRL+SHIFT+/"
         );
         assert!(!recording.finish_requested(now + CANCEL_WINDOW - Duration::from_millis(1)));
         assert!(!recording.finishing);
         recording.transcript.clear();
         assert!(recording.update_cancel_window(now + CANCEL_WINDOW));
-        assert_eq!(recording.status(), "Listening… · Waiting for transcript");
-        recording.transcript = "Meet Wednesday.".into();
-        assert_eq!(recording.status(), "Meet Wednesday.");
         assert_eq!(
-            recording.preview_badge().label(Some(Hotkey::default())),
+            recording.status(Locale::English),
+            "Listening… · Waiting for transcript"
+        );
+        recording.transcript = "Meet Wednesday.".into();
+        assert_eq!(recording.status(Locale::English), "Meet Wednesday.");
+        assert_eq!(
+            recording
+                .preview_badge()
+                .label(Some(Hotkey::default()), Locale::English),
             "STOP & COPY · CTRL+SHIFT+/"
         );
         let (clipboard, writes, feedback) = Clipboard::test_sink();
         let mut app = App {
+            locale: Locale::English,
             hwnd: null_mut(),
             pill: null_mut(),
             preview_shortcut: null_mut(),
