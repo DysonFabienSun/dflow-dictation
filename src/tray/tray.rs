@@ -22,6 +22,7 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
     System::{LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
     UI::{
+        Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW},
         HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
             GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
@@ -36,16 +37,23 @@ const TRAY: u32 = WM_APP + 1;
 const OPEN_MENU: u32 = WM_APP + 2;
 const RESTORE_ICON: u32 = WM_APP + 3;
 const PREVIEW_ACTION: u32 = WM_APP + 4;
+const PREVIEW_HOLD: u32 = WM_APP + 5;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const CANCEL_WINDOW: Duration = Duration::from_secs(2);
+const ABORT_HOLD: Duration = Duration::from_millis(750);
 const COMPLETED_PREVIEW_TIME: Duration = Duration::from_secs(3);
 const LAUNCH_PREVIEW_TIME: Duration = Duration::from_secs(7);
 const PREVIEW_LINES: usize = 3;
 const PREVIEW_SIDE_PADDING: i32 = 12;
 const PREVIEW_VERTICAL_PADDING: i32 = 10;
 const PREVIEW_LINE_GAP: i32 = 3;
-const SHORTCUT_HEIGHT: i32 = 18;
+const PREVIEW_ACCENT_WIDTH: i32 = 3;
+const SHORTCUT_HEIGHT: i32 = 23;
+const SHORTCUT_GAP: i32 = 4;
+const PROGRESS_CYCLE_MS: isize = 1100;
+const TICK_MS: u32 = 30;
 const PILL_WELCOME_SLOT: i32 = size_of::<isize>() as i32;
+const PILL_BADGE_SLOT: i32 = PILL_WELCOME_SLOT + size_of::<isize>() as i32;
 const TIMER: usize = 1;
 const SETTINGS: u32 = 1;
 const CANCEL: u32 = 2;
@@ -89,6 +97,24 @@ struct Recording {
     transcript: String,
 }
 
+#[derive(Clone, Copy)]
+enum HoldInput {
+    Hotkey(u32),
+    Button,
+}
+
+#[derive(Clone, Copy)]
+struct DictationHold {
+    started_at: Instant,
+    input: HoldInput,
+}
+
+enum CopyOrigin {
+    Manual,
+    BeforeCleanup,
+    Final(u64),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(isize)]
 enum PreviewBadge {
@@ -100,10 +126,58 @@ enum PreviewBadge {
     Copying,
     Copied,
     CopyFailed,
-    StopPending,
+    Listening,
+    CopyLast,
+    Holding,
 }
 
 impl PreviewBadge {
+    fn from_id(id: isize) -> Option<Self> {
+        const BADGES: [PreviewBadge; 11] = [
+            PreviewBadge::Cancel,
+            PreviewBadge::Stop,
+            PreviewBadge::SkipCleanup,
+            PreviewBadge::Dismiss,
+            PreviewBadge::Transcribing,
+            PreviewBadge::Copying,
+            PreviewBadge::Copied,
+            PreviewBadge::CopyFailed,
+            PreviewBadge::Listening,
+            PreviewBadge::CopyLast,
+            PreviewBadge::Holding,
+        ];
+        BADGES.get(id as usize).copied()
+    }
+
+    fn working(self) -> bool {
+        matches!(self, Self::Transcribing | Self::SkipCleanup | Self::Copying)
+    }
+
+    fn clickable(self) -> bool {
+        matches!(
+            self,
+            Self::Cancel
+                | Self::Stop
+                | Self::SkipCleanup
+                | Self::Dismiss
+                | Self::CopyLast
+                | Self::Holding
+        )
+    }
+
+    fn accent(self) -> Option<COLORREF> {
+        match self {
+            Self::Listening | Self::Cancel | Self::Stop | Self::CopyLast => Some(rgb(0, 129, 146)),
+            Self::Transcribing => Some(rgb(27, 104, 227)),
+            Self::SkipCleanup => Some(rgb(126, 69, 211)),
+            Self::Copying => Some(rgb(0, 119, 193)),
+            Self::Copied => Some(rgb(0, 137, 77)),
+            Self::CopyFailed => Some(rgb(184, 70, 24)),
+            Self::Holding => Some(rgb(207, 66, 39)),
+            Self::Dismiss => None,
+        }
+    }
+
     fn countdown(action: isize) -> Option<Duration> {
         match action {
             value if value == Self::Dismiss as isize => Some(LAUNCH_PREVIEW_TIME),
@@ -115,31 +189,27 @@ impl PreviewBadge {
     fn label(self, hotkey: Option<Hotkey>, locale: Locale) -> String {
         let label = match self {
             Self::Cancel => locale.text("CANCEL", "取消"),
-            Self::Stop | Self::StopPending => locale.text("STOP & COPY", "停止并复制"),
-            Self::SkipCleanup => locale.text("Cleaning up · Skip cleanup", "正在整理 · 跳过整理"),
+            Self::Stop => locale.text("STOP & COPY", "停止并复制"),
+            Self::SkipCleanup => locale.text("Skip cleanup", "跳过整理"),
             Self::Dismiss => locale.text("DISMISS", "关闭提示"),
-            Self::Transcribing | Self::Copying => locale.text("Finishing…", "正在完成转写…"),
-            Self::Copied => locale.text("Copied", "已复制"),
+            Self::Transcribing => locale.text("Finishing…", "正在完成转写…"),
+            Self::Copying => locale.text("Copying…", "正在复制…"),
+            Self::Copied => locale.text("COPIED", "已复制"),
             Self::CopyFailed => locale.text("Copy failed", "复制失败"),
+            Self::Listening => locale.text("Listening…", "正在录音…"),
+            Self::CopyLast => locale.text("Copy last transcript", "复制上次转写结果"),
+            Self::Holding => locale.text("Hold to abort", "长按取消听写"),
         };
         match hotkey {
             Some(hotkey)
                 if matches!(
                     self,
-                    Self::Cancel | Self::Stop | Self::StopPending | Self::Copied
+                    Self::Cancel | Self::Stop | Self::SkipCleanup | Self::Copied
                 ) =>
             {
                 format!("{label} · {}", hotkey.to_string().to_ascii_uppercase())
             }
             _ => label.into(),
-        }
-    }
-
-    fn for_preview_rows(self, rows: i32) -> Self {
-        if rows == 1 && matches!(self, Self::Transcribing | Self::Copying) {
-            Self::StopPending
-        } else {
-            self
         }
     }
 }
@@ -157,10 +227,10 @@ impl Recording {
     }
 
     fn finish_requested(&mut self, now: Instant) -> bool {
-        self.update_cancel_window(now);
-        if !self.can_stop {
+        if now.saturating_duration_since(self.started_at) < CANCEL_WINDOW {
             return false;
         }
+        self.can_stop = true;
         self.finishing = true;
         self.session.stop();
         true
@@ -256,17 +326,19 @@ struct App {
     hwnd: HWND,
     pill: HWND,
     preview_shortcut: HWND,
+    copy_shortcut: HWND,
     pill_font: Option<(i32, HFONT)>,
     icon: NOTIFYICONDATAW,
     path: PathBuf,
     binding: Option<Binding>,
     recording: Option<Recording>,
+    hold: Option<DictationHold>,
     last_transcript: Option<String>,
     recording_id: u64,
     completed_preview: Option<PreviewBadge>,
     status_until: Option<Instant>,
     clipboard: Clipboard,
-    copies_pending: VecDeque<Option<u64>>,
+    copies_pending: VecDeque<CopyOrigin>,
     timer: bool,
 }
 
@@ -395,10 +467,12 @@ pub fn run(mut config: Config) -> Result<(), String> {
         hwnd,
         pill,
         preview_shortcut: create_preview_shortcut(pill),
+        copy_shortcut: create_preview_shortcut(pill),
         pill_font: None,
         path: config.path.clone(),
         binding: None,
         recording: None,
+        hold: None,
         last_transcript: None,
         recording_id: 0,
         completed_preview: None,
@@ -481,9 +555,15 @@ pub fn run(mut config: Config) -> Result<(), String> {
                         .binding
                         .is_some_and(|binding| msg.wParam == binding.id as usize) =>
                 {
-                    app.toggle()
+                    app.dictation_key_pressed()
                 }
-                PREVIEW_ACTION if msg.lParam as HWND == app.preview_shortcut => {
+                PREVIEW_HOLD if msg.lParam as HWND == app.preview_shortcut => {
+                    app.begin_button_hold();
+                }
+                PREVIEW_ACTION
+                    if msg.lParam as HWND == app.preview_shortcut
+                        || msg.lParam as HWND == app.copy_shortcut =>
+                {
                     app.activate_preview_shortcut(msg.wParam as isize);
                 }
                 WM_TIMER if msg.wParam == TIMER => app.tick(),
@@ -552,6 +632,30 @@ fn blend_color(base: COLORREF, ink: COLORREF, ink_parts: u32) -> COLORREF {
     color
 }
 
+const fn rgb(red: u32, green: u32, blue: u32) -> COLORREF {
+    red | (green << 8) | (blue << 16)
+}
+
+fn key_down(key: u32) -> bool {
+    unsafe { GetAsyncKeyState(key as i32) < 0 }
+}
+
+fn high_contrast() -> bool {
+    let mut settings = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            settings.cbSize,
+            (&mut settings as *mut HIGHCONTRASTW).cast(),
+            0,
+        ) != 0
+            && settings.dwFlags & HCF_HIGHCONTRASTON != 0
+    }
+}
+
 fn scale_preview(px: i32, dpi: i32) -> i32 {
     (px * dpi + 48) / 96
 }
@@ -573,7 +677,7 @@ fn create_pill(owner: HWND) -> HWND {
     let class = wide("DFlowPreview");
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(pill_proc),
-        cbWndExtra: PILL_WELCOME_SLOT + size_of::<isize>() as i32,
+        cbWndExtra: PILL_BADGE_SLOT + size_of::<isize>() as i32,
         hInstance: instance(),
         lpszClassName: class.as_ptr(),
         ..Default::default()
@@ -602,6 +706,7 @@ fn create_pill(owner: HWND) -> HWND {
 unsafe extern "system" fn pill_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         match msg {
+            WM_ERASEBKGND => 1,
             WM_PAINT => {
                 paint_preview_window(hwnd, draw_pill);
                 0
@@ -642,6 +747,41 @@ fn paint_preview_window(hwnd: HWND, draw: fn(HWND, HDC)) {
     }
 }
 
+fn set_preview_text(hwnd: HWND, text: &[u16]) -> bool {
+    unsafe {
+        if GetWindowTextLengthW(hwnd) as usize + 1 == text.len() {
+            let mut current = vec![0; text.len()];
+            GetWindowTextW(hwnd, current.as_mut_ptr(), current.len() as i32);
+            if current == text {
+                return false;
+            }
+        }
+        SetWindowTextW(hwnd, text.as_ptr()) != 0
+    }
+}
+
+fn place_preview_window(hwnd: HWND, left: i32, top: i32, width: i32, height: i32) {
+    unsafe {
+        let mut current = RECT::default();
+        if IsWindowVisible(hwnd) == 0
+            || GetWindowRect(hwnd, &mut current) == 0
+            || (current.left, current.top, current.right, current.bottom)
+                != (left, top, left + width, top + height)
+        {
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                left,
+                top,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOZORDER,
+            );
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
+}
+
 fn draw_pill(hwnd: HWND, dc: HDC) {
     unsafe {
         let mut area = RECT::default();
@@ -650,14 +790,41 @@ fn draw_pill(hwnd: HWND, dc: HDC) {
         let preview = layout_dpi > 0;
         let dpi = layout_dpi.abs().max(96);
         let face = GetSysColor(COLOR_BTNFACE);
-        let ink = GetSysColor(COLOR_BTNTEXT);
-        let background = if preview {
-            blend_color(face, ink, 1)
+        let badge = PreviewBadge::from_id(GetWindowLongPtrW(hwnd, PILL_BADGE_SLOT) - 1);
+        let accent = badge.and_then(PreviewBadge::accent);
+        let contrast = high_contrast();
+        let white_welcome = badge == Some(PreviewBadge::Dismiss) && !contrast;
+        let ink = if white_welcome {
+            rgb(23, 23, 23)
         } else {
-            face
+            GetSysColor(COLOR_BTNTEXT)
+        };
+        let background = if white_welcome {
+            rgb(255, 255, 255)
+        } else {
+            match accent {
+                Some(accent) if !contrast => blend_color(face, accent, 2),
+                _ if preview && !contrast => blend_color(face, ink, 1),
+                _ => face,
+            }
         };
         SetDCBrushColor(dc, background);
         FillRect(dc, &area, GetStockObject(DC_BRUSH));
+        if let Some(accent) = accent {
+            let edge = RECT {
+                right: scale_preview(PREVIEW_ACCENT_WIDTH, dpi),
+                ..area
+            };
+            SetDCBrushColor(
+                dc,
+                if contrast {
+                    GetSysColor(COLOR_HIGHLIGHT)
+                } else {
+                    accent
+                },
+            );
+            FillRect(dc, &edge, GetStockObject(DC_BRUSH));
+        }
         SetBkMode(dc, TRANSPARENT as i32);
         SetTextColor(dc, ink);
         let font = GetWindowLongPtrW(hwnd, 0) as HFONT;
@@ -761,11 +928,11 @@ fn create_preview_shortcut(pill: HWND) -> HWND {
         ..Default::default()
     };
     unsafe {
-        if RegisterClassW(&window_class) == 0 {
+        if RegisterClassW(&window_class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
             return null_mut();
         }
-        let shortcut = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST | WS_EX_LAYERED,
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
             class.as_ptr(),
             null(),
             WS_POPUP,
@@ -777,11 +944,7 @@ fn create_preview_shortcut(pill: HWND) -> HWND {
             null_mut(),
             instance(),
             null(),
-        );
-        if !shortcut.is_null() {
-            SetLayeredWindowAttributes(shortcut, 0, 230, LWA_ALPHA);
-        }
-        shortcut
+        )
     }
 }
 
@@ -794,16 +957,34 @@ unsafe extern "system" fn preview_shortcut_proc(
     unsafe {
         match msg {
             WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+            WM_ERASEBKGND => 1,
             WM_SETCURSOR
-                if GetWindowLongPtrW(hwnd, GWLP_USERDATA) > PreviewBadge::Dismiss as isize =>
+                if !PreviewBadge::from_id(GetWindowLongPtrW(hwnd, GWLP_USERDATA))
+                    .is_some_and(PreviewBadge::clickable) =>
             {
                 SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
                 1
             }
             WM_LBUTTONDOWN
-                if GetWindowLongPtrW(hwnd, GWLP_USERDATA) <= PreviewBadge::Dismiss as isize =>
+                if PreviewBadge::from_id(GetWindowLongPtrW(hwnd, GWLP_USERDATA))
+                    .is_some_and(PreviewBadge::clickable) =>
             {
                 SetCapture(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+                let action = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+                if action == PreviewBadge::Stop as isize || action == PreviewBadge::Cancel as isize
+                {
+                    PostMessageW(
+                        GetAncestor(hwnd, GA_ROOTOWNER),
+                        PREVIEW_HOLD,
+                        0,
+                        hwnd as LPARAM,
+                    );
+                }
+                0
+            }
+            WM_CAPTURECHANGED => {
+                InvalidateRect(hwnd, null(), 0);
                 0
             }
             WM_LBUTTONUP if GetCapture() == hwnd => {
@@ -814,7 +995,7 @@ unsafe extern "system" fn preview_shortcut_proc(
                 };
                 let mut area = RECT::default();
                 let action = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-                if action <= PreviewBadge::Dismiss as isize
+                if PreviewBadge::from_id(action).is_some_and(PreviewBadge::clickable)
                     && GetClientRect(hwnd, &mut area) != 0
                     && PtInRect(&area, point) != 0
                 {
@@ -841,34 +1022,114 @@ fn draw_preview_shortcut(hwnd: HWND, dc: HDC) {
     let mut text = [0; 64];
     unsafe {
         GetClientRect(hwnd, &mut area);
-        let ink = GetSysColor(COLOR_BTNTEXT);
         let action = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        let badge = PreviewBadge::from_id(action).unwrap_or(PreviewBadge::Cancel);
+        let copy_button = badge == PreviewBadge::CopyLast;
         let face = GetSysColor(COLOR_BTNFACE);
-        SetDCBrushColor(dc, blend_color(face, ink, 1));
-        FillRect(dc, &area, GetStockObject(DC_BRUSH));
-        if let Some(duration) = PreviewBadge::countdown(action) {
-            let remaining_ms = GetWindowLongPtrW(hwnd, 0) as i64;
-            let duration_ms = duration.as_millis() as i64;
-            let filled = (i64::from(area.right - area.left) * remaining_ms / duration_ms) as i32;
-            let fill = RECT {
-                right: area.left + filled,
-                ..area
-            };
-            SetDCBrushColor(dc, blend_color(face, GetSysColor(COLOR_HIGHLIGHT), 3));
-            FillRect(dc, &fill, GetStockObject(DC_BRUSH));
-        }
-        SetBkMode(dc, TRANSPARENT as i32);
-        SetTextColor(dc, ink);
-        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
-        let alignment = if action == PreviewBadge::Dismiss as isize
-            || action == PreviewBadge::Copied as isize
-            || action == PreviewBadge::Transcribing as isize
-            || action == PreviewBadge::Copying as isize
-        {
-            DT_CENTER
+        let ink = GetSysColor(COLOR_BTNTEXT);
+        let highlight = GetSysColor(COLOR_HIGHLIGHT);
+        let contrast = high_contrast();
+        let accent = if contrast {
+            highlight
         } else {
-            area.right -= 9 * dpi / 96;
+            badge.accent().unwrap_or(highlight)
+        };
+        let pressed = GetCapture() == hwnd && badge != PreviewBadge::Holding;
+        let background = if pressed {
+            highlight
+        } else if contrast {
+            face
+        } else {
+            match badge {
+                PreviewBadge::Cancel | PreviewBadge::Stop => blend_color(face, ink, 1),
+                PreviewBadge::CopyLast => blend_color(face, accent, 2),
+                _ => blend_color(face, accent, 3),
+            }
+        };
+        let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+        SetDCBrushColor(dc, background);
+        FillRect(dc, &area, GetStockObject(DC_BRUSH));
+        if badge.clickable() && badge != PreviewBadge::Holding {
+            SetDCBrushColor(
+                dc,
+                if pressed {
+                    GetSysColor(COLOR_HIGHLIGHTTEXT)
+                } else if contrast {
+                    ink
+                } else if copy_button {
+                    GetSysColor(COLOR_WINDOWFRAME)
+                } else {
+                    accent
+                },
+            );
+            FrameRect(dc, &area, GetStockObject(DC_BRUSH));
+        }
+        if copy_button {
+            let owner = GetWindow(hwnd, GW_OWNER);
+            let preview_dpi = (GetWindowLongPtrW(owner, GWLP_USERDATA) as i32)
+                .abs()
+                .max(96);
+            let inset = GetSystemMetricsForDpi(SM_CXBORDER, preview_dpi as u32);
+            let edge = RECT {
+                left: inset,
+                top: 1,
+                right: inset + scale_preview(PREVIEW_ACCENT_WIDTH, preview_dpi),
+                bottom: area.bottom - 1,
+            };
+            SetDCBrushColor(
+                dc,
+                if pressed {
+                    GetSysColor(COLOR_HIGHLIGHTTEXT)
+                } else {
+                    accent
+                },
+            );
+            FillRect(dc, &edge, GetStockObject(DC_BRUSH));
+            area.left = edge.right;
+        }
+        let progress = GetWindowLongPtrW(hwnd, 0);
+        let width = area.right;
+        let mut track = area;
+        if badge.working() {
+            let segment = width / 3;
+            let start =
+                ((width + segment) as isize * progress / PROGRESS_CYCLE_MS) as i32 - segment;
+            track.left = start.max(0);
+            track.right = (start + segment).min(width);
+        } else if let Some(duration) = PreviewBadge::countdown(action) {
+            track.right = (width as isize * progress / duration.as_millis() as isize) as i32;
+        } else if badge == PreviewBadge::Holding {
+            track.right = (width as isize * progress / ABORT_HOLD.as_millis() as isize) as i32;
+        } else {
+            track.right = 0;
+        }
+        if track.right > track.left {
+            track.top = track.bottom - scale_preview(3, dpi);
+            SetDCBrushColor(
+                dc,
+                if pressed && contrast {
+                    GetSysColor(COLOR_HIGHLIGHTTEXT)
+                } else {
+                    accent
+                },
+            );
+            FillRect(dc, &track, GetStockObject(DC_BRUSH));
+        }
+        area.bottom -= scale_preview(2, dpi);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(
+            dc,
+            if pressed {
+                GetSysColor(COLOR_HIGHLIGHTTEXT)
+            } else {
+                ink
+            },
+        );
+        let alignment = if matches!(badge, PreviewBadge::Cancel | PreviewBadge::Stop) {
+            area.right -= scale_preview(9, dpi);
             DT_RIGHT
+        } else {
+            DT_CENTER
         };
         let font = create_indicator_font(dpi, 11);
         if !font.is_null() {
@@ -924,10 +1185,88 @@ impl App {
         }
     }
 
-    fn toggle(&mut self) {
+    fn dictation_key_pressed(&mut self) {
+        let now = Instant::now();
+        let Some(recording) = &self.recording else {
+            self.toggle(now);
+            return;
+        };
+        if recording.cleaning {
+            self.finish_recording();
+            return;
+        }
+        if let Some(hold) = self.hold {
+            // MOD_NOREPEAT means another hotkey message follows a release.
+            if matches!(hold.input, HoldInput::Hotkey(_)) {
+                self.finish_hold(hold, now);
+            }
+            return;
+        }
+        let Some(binding) = self.binding else { return };
+        if key_down(binding.hotkey.key) {
+            self.begin_hold(HoldInput::Hotkey(binding.hotkey.key), now);
+        } else {
+            self.toggle(now);
+        }
+    }
+
+    fn begin_button_hold(&mut self) {
+        if unsafe { GetCapture() == self.preview_shortcut } {
+            self.begin_hold(HoldInput::Button, Instant::now());
+        }
+    }
+
+    fn begin_hold(&mut self, input: HoldInput, now: Instant) {
+        if self.hold.is_none() && self.recording.as_ref().is_some_and(|r| !r.finishing) {
+            self.hold = Some(DictationHold {
+                started_at: now,
+                input,
+            });
+            self.recording_status();
+        }
+    }
+
+    fn finish_hold(&mut self, hold: DictationHold, now: Instant) {
+        self.hold = None;
+        if now.saturating_duration_since(hold.started_at) >= ABORT_HOLD {
+            self.cancel_recording();
+        } else {
+            self.toggle(hold.started_at);
+        }
+    }
+
+    fn tick_hold(&mut self, now: Instant) {
+        let Some(hold) = self.hold else { return };
+        let expired = now.saturating_duration_since(hold.started_at) >= ABORT_HOLD;
+        match hold.input {
+            HoldInput::Hotkey(key) if expired || !key_down(key) => self.finish_hold(hold, now),
+            HoldInput::Button => unsafe {
+                if GetCapture() != self.preview_shortcut {
+                    self.hold = None;
+                    self.recording_status();
+                } else if expired {
+                    let mut cursor = POINT::default();
+                    let mut button = RECT::default();
+                    if GetCursorPos(&mut cursor) != 0
+                        && GetWindowRect(self.preview_shortcut, &mut button) != 0
+                        && PtInRect(&button, cursor) != 0
+                    {
+                        self.finish_hold(hold, now);
+                    } else {
+                        ReleaseCapture();
+                        self.hold = None;
+                        self.recording_status();
+                    }
+                }
+            },
+            HoldInput::Hotkey(_) => {}
+        }
+    }
+
+    fn toggle(&mut self, at: Instant) {
         if let Some(recording) = self.recording.as_mut() {
             if !recording.finishing {
-                if recording.finish_requested(Instant::now()) {
+                if recording.finish_requested(at) {
                     self.recording_status();
                 } else {
                     self.cancel_recording();
@@ -938,7 +1277,7 @@ impl App {
             self.recording_id += 1;
             self.recording = Some(Recording {
                 session: Session::start_from_config(self.path.clone(), self.locale),
-                started_at: Instant::now(),
+                started_at: at,
                 can_stop: false,
                 listening: false,
                 quiet: false,
@@ -971,6 +1310,10 @@ impl App {
     }
 
     fn activate_preview_shortcut(&mut self, action: isize) {
+        if action == PreviewBadge::CopyLast as isize {
+            self.copy_last_transcript(CopyOrigin::Manual);
+            return;
+        }
         if action == PreviewBadge::SkipCleanup as isize {
             if self
                 .recording
@@ -998,8 +1341,12 @@ impl App {
             .as_ref()
             .is_some_and(|recording| recording.previewing() && !recording.finishing)
         {
-            if action == PreviewBadge::Stop as isize {
-                self.toggle();
+            if let Some(hold) = self.hold {
+                if matches!(hold.input, HoldInput::Button) {
+                    self.finish_hold(hold, Instant::now());
+                }
+            } else if action == PreviewBadge::Stop as isize {
+                self.toggle(Instant::now());
             } else if action == PreviewBadge::Cancel as isize {
                 self.cancel_recording();
             }
@@ -1012,10 +1359,12 @@ impl App {
     }
 
     fn tick(&mut self) {
+        let now = Instant::now();
+        self.tick_hold(now);
         let mut redraw = self
             .recording
             .as_mut()
-            .is_some_and(|recording| recording.update_cancel_window(Instant::now()));
+            .is_some_and(|recording| recording.update_cancel_window(now));
         while let Some(recording) = &mut self.recording {
             match recording.session.updates.try_recv() {
                 Ok(Update::Live) if !recording.finishing => {
@@ -1027,17 +1376,26 @@ impl App {
                     redraw = true;
                 }
                 Ok(Update::Finishing) => {
+                    self.hold = None;
                     recording.finishing = true;
                     redraw = true;
                 }
                 Ok(Update::Live | Update::QuietInput(_)) => {}
                 Ok(Update::Transcript(text)) => {
-                    recording.transcript = text;
-                    redraw = true;
+                    if recording.transcript != text {
+                        recording.transcript = text;
+                        redraw = true;
+                    }
                 }
                 Ok(Update::Cleaning) => {
+                    self.hold = None;
                     recording.cleaning = true;
                     recording.finishing = true;
+                    if !recording.transcript.trim().is_empty()
+                        && self.clipboard.copy(&recording.transcript, None)
+                    {
+                        self.copies_pending.push_back(CopyOrigin::BeforeCleanup);
+                    }
                     redraw = true;
                     break;
                 }
@@ -1072,18 +1430,40 @@ impl App {
                 self.copy_feedback(origin, feedback);
             }
         }
-        if let Some(until) = self.status_until
-            && !self.preview_shortcut.is_null()
-        {
-            unsafe {
-                let action = GetWindowLongPtrW(self.preview_shortcut, GWLP_USERDATA);
-                if IsWindowVisible(self.preview_shortcut) != 0
-                    && PreviewBadge::countdown(action).is_some()
-                {
-                    let remaining = until.saturating_duration_since(Instant::now());
-                    SetWindowLongPtrW(self.preview_shortcut, 0, remaining.as_millis() as isize);
-                    InvalidateRect(self.preview_shortcut, null(), 0);
-                }
+        self.update_preview_progress(Instant::now());
+    }
+
+    fn update_preview_progress(&self, now: Instant) {
+        let hwnd = self.preview_shortcut;
+        if hwnd.is_null() || unsafe { IsWindowVisible(hwnd) } == 0 {
+            return;
+        }
+        unsafe {
+            let action = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+            let Some(badge) = PreviewBadge::from_id(action) else {
+                return;
+            };
+            let progress = if badge == PreviewBadge::Holding {
+                self.hold.map(|hold| {
+                    now.saturating_duration_since(hold.started_at)
+                        .min(ABORT_HOLD)
+                        .as_millis() as isize
+                })
+            } else if badge.working() {
+                Some((GetWindowLongPtrW(hwnd, 0) + TICK_MS as isize) % PROGRESS_CYCLE_MS)
+            } else {
+                self.status_until
+                    .zip(PreviewBadge::countdown(action))
+                    .map(|(until, duration)| {
+                        until
+                            .saturating_duration_since(now)
+                            .min(duration)
+                            .as_millis() as isize
+                    })
+            };
+            if let Some(progress) = progress {
+                SetWindowLongPtrW(hwnd, 0, progress);
+                InvalidateRect(hwnd, null(), 0);
             }
         }
     }
@@ -1092,6 +1472,7 @@ impl App {
         let Some(recording) = self.recording.take() else {
             return;
         };
+        self.hold = None;
         drop(recording.session);
         if recording.transcript.trim().is_empty() {
             self.notice_for(
@@ -1101,34 +1482,27 @@ impl App {
             return;
         }
         self.completed_preview = Some(PreviewBadge::Copying);
-        let preview = recording
-            .cleanup_error
-            .map(|error| format!("{}\n{error}", recording.transcript));
-        self.indicator(
-            preview.as_deref().unwrap_or(&recording.transcript),
-            self.completed_preview,
+        let preview = recording.cleanup_error.map_or_else(
+            || recording.transcript.clone(),
+            |error| format!("{}\n{error}", recording.transcript),
         );
-        if !self.pill.is_null() {
-            unsafe {
-                RedrawWindow(
-                    self.pill,
-                    null(),
-                    null_mut(),
-                    RDW_INVALIDATE | RDW_UPDATENOW,
-                )
-            };
+        self.last_transcript = Some(recording.transcript);
+        self.indicator(&preview, self.completed_preview);
+        for hwnd in [self.pill, self.preview_shortcut] {
+            if !hwnd.is_null() {
+                unsafe { UpdateWindow(hwnd) };
+            }
         }
         self.status_until = Some(Instant::now() + COMPLETED_PREVIEW_TIME);
-        self.last_transcript = Some(recording.transcript);
-        self.copy_last_transcript(Some(self.recording_id));
+        self.copy_last_transcript(CopyOrigin::Final(self.recording_id));
     }
 
-    fn copy_feedback(&mut self, origin: Option<u64>, feedback: ClipboardFeedback) {
-        if self.recording.is_some() {
+    fn copy_feedback(&mut self, origin: CopyOrigin, feedback: ClipboardFeedback) {
+        if matches!(origin, CopyOrigin::BeforeCleanup) || self.recording.is_some() {
             return;
         }
         let copied = matches!(feedback, ClipboardFeedback::Copied(_));
-        if let Some(id) = origin {
+        if let CopyOrigin::Final(id) = origin {
             if id != self.recording_id {
                 return;
             }
@@ -1139,9 +1513,11 @@ impl App {
                     PreviewBadge::CopyFailed
                 };
                 self.completed_preview = Some(badge);
+                self.status_until = Some(Instant::now() + COMPLETED_PREVIEW_TIME);
                 let mut area = RECT::default();
                 if !self.pill.is_null() && unsafe { GetWindowRect(self.pill, &mut area) } != 0 {
                     let dpi = unsafe { GetDpiForWindow(self.pill) }.max(96) as i32;
+                    self.set_pill_badge(Some(badge));
                     self.show_preview_shortcut(Some(badge), area.right, area.top, dpi);
                 }
                 return;
@@ -1271,7 +1647,7 @@ impl App {
                 self.finish_recording()
             }
             CANCEL => self.cancel_recording(),
-            COPY => self.copy_last_transcript(None),
+            COPY => self.copy_last_transcript(CopyOrigin::Manual),
             EXIT => unsafe {
                 PostQuitMessage(0);
             },
@@ -1279,7 +1655,7 @@ impl App {
         }
     }
 
-    fn copy_last_transcript(&mut self, origin: Option<u64>) {
+    fn copy_last_transcript(&mut self, origin: CopyOrigin) {
         if let Some(text) = &self.last_transcript {
             if self.clipboard.copy(text, None) {
                 self.copies_pending.push_back(origin);
@@ -1294,7 +1670,7 @@ impl App {
             || self.status_until.is_some()
             || !self.copies_pending.is_empty();
         if needed && !self.timer {
-            self.timer = unsafe { SetTimer(self.hwnd, TIMER, 30, None) != 0 };
+            self.timer = unsafe { SetTimer(self.hwnd, TIMER, TICK_MS, None) != 0 };
         } else if !needed && self.timer {
             unsafe {
                 KillTimer(self.hwnd, TIMER);
@@ -1303,11 +1679,23 @@ impl App {
         }
     }
 
-    fn indicator(&mut self, text: &str, mut badge: Option<PreviewBadge>) {
+    fn set_pill_badge(&self, badge: Option<PreviewBadge>) {
+        unsafe {
+            SetWindowLongPtrW(
+                self.pill,
+                PILL_BADGE_SLOT,
+                badge.map_or(0, |badge| badge as isize + 1),
+            );
+            InvalidateRect(self.pill, null(), 0);
+        }
+    }
+
+    fn indicator(&mut self, text: &str, badge: Option<PreviewBadge>) {
         if self.pill.is_null() {
             return;
         }
-        let preview = badge.is_some();
+        let shortcut = badge.filter(|&badge| badge != PreviewBadge::Listening);
+        let preview = self.recording.is_some() || shortcut.is_some();
         let target = unsafe { GetForegroundWindow() };
         let monitor = unsafe { MonitorFromWindow(target, MONITOR_DEFAULTTOPRIMARY) };
         let mut info = MONITORINFO {
@@ -1346,7 +1734,6 @@ impl App {
             };
             rendered = wrapped;
             let rows = rendered.lines().count().max(1) as i32;
-            badge = badge.map(|badge| badge.for_preview_rows(rows));
             let height = preview_text_height(rows, line_height, dpi)
                 + 2 * (border_y + scale_preview(PREVIEW_VERTICAL_PADDING, dpi));
             (rendered.as_str(), height)
@@ -1358,6 +1745,7 @@ impl App {
         };
         let left = (work.left + work.right - width) / 2;
         let top = work.bottom - height - 24 * dpi / 96;
+        self.set_pill_badge(badge);
         unsafe {
             SetWindowLongPtrW(
                 self.pill,
@@ -1373,19 +1761,23 @@ impl App {
                     0
                 },
             );
-            SetWindowTextW(self.pill, wide(text).as_ptr());
-            SetWindowPos(
-                self.pill,
-                HWND_TOPMOST,
-                left,
-                top,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            InvalidateRect(self.pill, null(), 0);
         }
-        self.show_preview_shortcut(badge, left + width, top, dpi);
+        set_preview_text(self.pill, &wide(text));
+        place_preview_window(self.pill, left, top, width, height);
+        self.show_preview_shortcut(shortcut, left + width, top, dpi);
+        if !self.copy_shortcut.is_null() {
+            if self.last_transcript.is_some() {
+                self.position_preview_shortcut(
+                    self.copy_shortcut,
+                    PreviewBadge::CopyLast,
+                    left,
+                    top,
+                    dpi,
+                );
+            } else {
+                self.hide_preview_shortcut(self.copy_shortcut);
+            }
+        }
     }
 
     fn show_preview_shortcut(&self, badge: Option<PreviewBadge>, right: i32, top: i32, dpi: i32) {
@@ -1393,33 +1785,53 @@ impl App {
             return;
         }
         let Some(badge) = badge else {
-            self.hide_preview_shortcut();
+            self.hide_preview_shortcut(self.preview_shortcut);
             return;
         };
+        self.position_preview_shortcut(self.preview_shortcut, badge, right, top, dpi);
+    }
+
+    fn position_preview_shortcut(
+        &self,
+        hwnd: HWND,
+        badge: PreviewBadge,
+        anchor: i32,
+        top: i32,
+        dpi: i32,
+    ) {
+        let copy_button = badge == PreviewBadge::CopyLast;
         let hotkey = self.binding.map(|binding| binding.hotkey);
         let label = wide(&badge.label(hotkey, self.locale));
-        let sizing_label = if matches!(badge, PreviewBadge::Dismiss | PreviewBadge::SkipCleanup) {
-            label.clone()
+        let stop_label = if matches!(badge, PreviewBadge::Dismiss | PreviewBadge::CopyLast) {
+            None
         } else {
-            wide(&PreviewBadge::Stop.label(hotkey, self.locale))
+            Some(wide(&PreviewBadge::Stop.label(hotkey, self.locale)))
         };
-        let height = SHORTCUT_HEIGHT * dpi / 96;
-        let mut length = SIZE {
-            cx: 130 * dpi / 96,
-            cy: 0,
-        };
+        let height = scale_preview(SHORTCUT_HEIGHT, dpi);
         unsafe {
+            let mut width = scale_preview(130, dpi);
             let dc = GetDC(self.pill);
             if !dc.is_null() {
                 let font = create_indicator_font(dpi, 11);
                 if !font.is_null() {
                     let previous = SelectObject(dc, font);
+                    let mut length = SIZE::default();
                     GetTextExtentPoint32W(
                         dc,
-                        sizing_label.as_ptr(),
-                        (sizing_label.len() - 1) as i32,
+                        label.as_ptr(),
+                        (label.len() - 1) as i32,
                         &mut length,
                     );
+                    width = length.cx;
+                    if let Some(stop_label) = stop_label {
+                        GetTextExtentPoint32W(
+                            dc,
+                            stop_label.as_ptr(),
+                            (stop_label.len() - 1) as i32,
+                            &mut length,
+                        );
+                        width = width.max(length.cx);
+                    }
                     SelectObject(dc, previous);
                     DeleteObject(font);
                 }
@@ -1430,50 +1842,46 @@ impl App {
             } else {
                 18
             };
-            let width = length.cx + scale_preview(padding, dpi);
-            if badge as isize > PreviewBadge::Dismiss as isize
-                && GetCapture() == self.preview_shortcut
-            {
-                ReleaseCapture();
+            let width = width + scale_preview(padding, dpi);
+            let visible = IsWindowVisible(hwnd) != 0;
+            let badge_changed = GetWindowLongPtrW(hwnd, GWLP_USERDATA) != badge as isize;
+            if badge_changed || !visible {
+                if badge != PreviewBadge::Holding && GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
+                let progress = if let Some(duration) = PreviewBadge::countdown(badge as isize) {
+                    duration.as_millis() as isize
+                } else if badge.working() {
+                    PROGRESS_CYCLE_MS / 8
+                } else {
+                    0
+                };
+                SetWindowLongPtrW(hwnd, 0, progress);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, badge as isize);
             }
-            if let Some(duration) = PreviewBadge::countdown(badge as isize) {
-                let remaining = self.status_until.map_or(duration, |until| {
-                    until
-                        .saturating_duration_since(Instant::now())
-                        .min(duration)
-                });
-                SetWindowLongPtrW(self.preview_shortcut, 0, remaining.as_millis() as isize);
+            let label_changed = set_preview_text(hwnd, &label);
+            let left = if copy_button { anchor } else { anchor - width };
+            let top = top - height - scale_preview(SHORTCUT_GAP, dpi);
+            let holding_button = visible && badge == PreviewBadge::Holding && GetCapture() == hwnd;
+            if !holding_button {
+                place_preview_window(hwnd, left, top, width, height);
             }
-            SetWindowLongPtrW(self.preview_shortcut, GWLP_USERDATA, badge as isize);
-            SetWindowTextW(self.preview_shortcut, label.as_ptr());
-            let left = right - width;
-            let top = top - height - 4 * dpi / 96;
-            let mut current = RECT::default();
-            if IsWindowVisible(self.preview_shortcut) == 0
-                || GetWindowRect(self.preview_shortcut, &mut current) == 0
-                || (current.left, current.top, current.right, current.bottom)
-                    != (left, top, right, top + height)
-            {
-                SetWindowPos(
-                    self.preview_shortcut,
-                    HWND_TOPMOST,
-                    left,
-                    top,
-                    width,
-                    height,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
-                );
+            if badge_changed || label_changed {
+                InvalidateRect(hwnd, null(), 0);
             }
-            InvalidateRect(self.preview_shortcut, null(), 0);
         }
     }
 
     fn recording_status(&mut self) {
         if let Some(recording) = &self.recording {
-            self.indicator(
-                &recording.status(self.locale),
-                recording.previewing().then(|| recording.preview_badge()),
-            );
+            let badge = if self.hold.is_some() {
+                Some(PreviewBadge::Holding)
+            } else if recording.previewing() || recording.finishing {
+                Some(recording.preview_badge())
+            } else {
+                (recording.listening && !recording.quiet).then_some(PreviewBadge::Listening)
+            };
+            self.indicator(&recording.status(self.locale), badge);
         }
     }
 
@@ -1535,21 +1943,23 @@ impl App {
     }
 
     fn hide(&mut self) {
+        self.hold = None;
         self.status_until = None;
         self.completed_preview = None;
-        self.hide_preview_shortcut();
+        self.hide_preview_shortcut(self.preview_shortcut);
+        self.hide_preview_shortcut(self.copy_shortcut);
         unsafe {
             ShowWindow(self.pill, SW_HIDE);
         }
     }
 
-    fn hide_preview_shortcut(&self) {
-        if !self.preview_shortcut.is_null() {
+    fn hide_preview_shortcut(&self, hwnd: HWND) {
+        if !hwnd.is_null() {
             unsafe {
-                if GetCapture() == self.preview_shortcut {
+                if GetCapture() == hwnd {
                     ReleaseCapture();
                 }
-                ShowWindow(self.preview_shortcut, SW_HIDE);
+                ShowWindow(hwnd, SW_HIDE);
             }
         }
     }
@@ -1639,7 +2049,12 @@ mod tests {
             assert!(!pill.is_null());
             let screen = GetDC(null_mut());
             let dc = CreateCompatibleDC(screen);
-            let background = blend_color(GetSysColor(COLOR_BTNFACE), GetSysColor(COLOR_BTNTEXT), 1);
+            let face = GetSysColor(COLOR_BTNFACE);
+            let background = if high_contrast() {
+                face
+            } else {
+                blend_color(face, GetSysColor(COLOR_BTNTEXT), 1)
+            };
             for dpi in [96, 144] {
                 let font = create_indicator_font(dpi, 14);
                 assert!(!font.is_null());
@@ -1686,6 +2101,15 @@ mod tests {
                             assert!(!(top + line..top + line + gap).any(ink));
                         }
                     }
+                    SetWindowLongPtrW(pill, PILL_BADGE_SLOT, PreviewBadge::Dismiss as isize + 1);
+                    SendMessageW(pill, WM_PRINTCLIENT, dc as WPARAM, 0);
+                    let welcome = if high_contrast() {
+                        face
+                    } else {
+                        rgb(255, 255, 255)
+                    };
+                    assert_eq!(GetPixel(dc, width / 2, 0), welcome);
+                    SetWindowLongPtrW(pill, PILL_BADGE_SLOT, 0);
                     SelectObject(dc, previous_bitmap);
                     DeleteObject(bitmap);
                 }
@@ -1723,7 +2147,12 @@ mod tests {
             let bitmap = CreateCompatibleBitmap(screen, width, SHORTCUT_HEIGHT);
             let previous = SelectObject(dc, bitmap);
             SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
-            let background = blend_color(GetSysColor(COLOR_BTNFACE), GetSysColor(COLOR_BTNTEXT), 1);
+            let face = GetSysColor(COLOR_BTNFACE);
+            let background = if high_contrast() {
+                face
+            } else {
+                blend_color(face, GetSysColor(COLOR_BTNTEXT), 1)
+            };
             let left = GetPixel(dc, 10, 8);
             let right_has_text = (0..SHORTCUT_HEIGHT)
                 .any(|y| ((width - 120)..(width - 9)).any(|x| GetPixel(dc, x, y) != background));
@@ -1731,11 +2160,55 @@ mod tests {
                 SetWindowLongPtrW(shortcut, GWLP_USERDATA, badge as isize);
                 SetWindowTextW(shortcut, wide(&badge.label(None, Locale::English)).as_ptr());
                 SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+                let background = GetPixel(dc, 0, 0);
                 let mut ink = (0..width)
                     .filter(|&x| (0..SHORTCUT_HEIGHT).any(|y| GetPixel(dc, x, y) != background));
                 let first = ink.next().unwrap();
                 let last = ink.last().unwrap();
                 assert!((first + last - width).abs() <= 4);
+            }
+            SetWindowLongPtrW(shortcut, GWLP_USERDATA, PreviewBadge::CopyLast as isize);
+            SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+            let copy_accent = if high_contrast() {
+                GetSysColor(COLOR_HIGHLIGHT)
+            } else {
+                PreviewBadge::CopyLast.accent().unwrap()
+            };
+            let y = SHORTCUT_HEIGHT / 2;
+            for dpi in [96, 144] {
+                SetWindowLongPtrW(parent, GWLP_USERDATA, dpi as isize);
+                SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+                let inset = GetSystemMetricsForDpi(SM_CXBORDER, dpi as u32);
+                let edge = inset + scale_preview(PREVIEW_ACCENT_WIDTH, dpi);
+                assert!((inset..edge).all(|x| GetPixel(dc, x, y) == copy_accent));
+                assert_ne!(GetPixel(dc, edge, y), copy_accent);
+            }
+            for badge in [
+                PreviewBadge::Transcribing,
+                PreviewBadge::SkipCleanup,
+                PreviewBadge::Copying,
+                PreviewBadge::Holding,
+            ] {
+                SetWindowLongPtrW(shortcut, GWLP_USERDATA, badge as isize);
+                let accent = if high_contrast() {
+                    GetSysColor(COLOR_HIGHLIGHT)
+                } else {
+                    badge.accent().unwrap()
+                };
+                let y = SHORTCUT_HEIGHT - 2;
+                let halfway = ABORT_HOLD.as_millis() as isize / 2;
+                let (early, late) = if badge.working() {
+                    (PROGRESS_CYCLE_MS / 4, PROGRESS_CYCLE_MS * 3 / 4)
+                } else {
+                    (halfway, halfway * 2)
+                };
+                SetWindowLongPtrW(shortcut, 0, early);
+                SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+                assert_eq!(GetPixel(dc, width / 4, y), accent);
+                assert_ne!(GetPixel(dc, width * 3 / 4, y), accent);
+                SetWindowLongPtrW(shortcut, 0, late);
+                SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+                assert_eq!(GetPixel(dc, width * 3 / 4, y), accent);
             }
             SetWindowLongPtrW(shortcut, GWLP_USERDATA, PreviewBadge::Cancel as isize);
             assert_eq!(
@@ -1759,6 +2232,8 @@ mod tests {
                 PreviewBadge::Cancel,
                 PreviewBadge::Stop,
                 PreviewBadge::Dismiss,
+                PreviewBadge::SkipCleanup,
+                PreviewBadge::CopyLast,
             ] {
                 SetWindowLongPtrW(shortcut, GWLP_USERDATA, action as isize);
                 SendMessageW(shortcut, WM_LBUTTONDOWN, 0, 0);
@@ -1776,13 +2251,25 @@ mod tests {
                 assert_eq!(message.wParam, action as WPARAM);
                 assert_eq!(message.lParam, shortcut as LPARAM);
             }
-            let accent = blend_color(GetSysColor(COLOR_BTNFACE), GetSysColor(COLOR_HIGHLIGHT), 3);
             for (badge, duration) in [
                 (PreviewBadge::Dismiss, LAUNCH_PREVIEW_TIME),
                 (PreviewBadge::Copied, COMPLETED_PREVIEW_TIME),
             ] {
                 SetWindowLongPtrW(shortcut, GWLP_USERDATA, badge as isize);
+                let accent = if high_contrast() {
+                    GetSysColor(COLOR_HIGHLIGHT)
+                } else {
+                    badge
+                        .accent()
+                        .unwrap_or_else(|| GetSysColor(COLOR_HIGHLIGHT))
+                };
+                let background = if high_contrast() {
+                    GetSysColor(COLOR_BTNFACE)
+                } else {
+                    blend_color(GetSysColor(COLOR_BTNFACE), accent, 3)
+                };
                 let total_ms = duration.as_millis() as isize;
+                let y = SHORTCUT_HEIGHT - 2;
                 for (remaining_ms, expected_right) in [
                     (total_ms, accent),
                     (total_ms / 2, background),
@@ -1790,9 +2277,9 @@ mod tests {
                 ] {
                     SetWindowLongPtrW(shortcut, 0, remaining_ms);
                     SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
-                    assert_eq!(GetPixel(dc, width * 3 / 4, 0), expected_right);
+                    assert_eq!(GetPixel(dc, width * 3 / 4, y), expected_right);
                     assert_eq!(
-                        GetPixel(dc, width / 4, 0),
+                        GetPixel(dc, width / 4, y),
                         if remaining_ms > 0 { accent } else { background }
                     );
                 }
@@ -1825,11 +2312,13 @@ mod tests {
                 hwnd: parent,
                 pill,
                 preview_shortcut: shortcut,
+                copy_shortcut: create_preview_shortcut(pill),
                 pill_font: None,
                 icon: NOTIFYICONDATAW::default(),
                 path: PathBuf::new(),
                 binding: Some(Binding { id: 1, hotkey }),
                 recording: None,
+                hold: None,
                 last_transcript: None,
                 recording_id: 0,
                 completed_preview: None,
@@ -1870,6 +2359,52 @@ mod tests {
             assert_eq!(IsWindowVisible(pill), 0);
             assert_eq!(IsWindowVisible(shortcut), 0);
 
+            assert_eq!(IsWindowVisible(app.copy_shortcut), 0);
+            app.last_transcript = Some("Previous transcript.".into());
+            let (session, _updates) = Session::test_channel();
+            app.recording = Some(Recording {
+                session,
+                started_at: Instant::now(),
+                can_stop: false,
+                listening: false,
+                quiet: false,
+                finishing: false,
+                cleaning: false,
+                cleanup_error: None,
+                transcript: String::new(),
+            });
+            let bounds = |hwnd| {
+                let mut area = RECT::default();
+                assert_ne!(GetWindowRect(hwnd, &mut area), 0);
+                (area.left, area.top, area.right, area.bottom)
+            };
+            app.recording_status();
+            let initial_body = bounds(pill);
+            let initial_copy = bounds(app.copy_shortcut);
+            let recording = app.recording.as_mut().unwrap();
+            recording.listening = true;
+            app.recording_status();
+            assert_eq!(bounds(pill), initial_body);
+            for transcript in ["First words.", "The current transcript."] {
+                app.recording.as_mut().unwrap().transcript = transcript.into();
+                app.recording_status();
+                assert_eq!(bounds(pill), initial_body);
+                assert_eq!(bounds(app.copy_shortcut), initial_copy);
+            }
+            let (mut copy, mut stop) = (RECT::default(), RECT::default());
+            assert_ne!(GetWindowRect(app.copy_shortcut, &mut copy), 0);
+            assert_ne!(GetWindowRect(shortcut, &mut stop), 0);
+            let dpi = GetWindowLongPtrW(pill, GWLP_USERDATA) as i32;
+            let (preview_left, preview_top, preview_right, _) = initial_body;
+            assert_eq!((copy.left, stop.right), (preview_left, preview_right));
+            assert_eq!((copy.top, copy.bottom), (stop.top, stop.bottom));
+            assert_eq!(preview_top - copy.bottom, scale_preview(SHORTCUT_GAP, dpi));
+            assert!(copy.right < stop.left);
+            assert_eq!(IsWindowVisible(app.copy_shortcut), 1);
+            app.recording = None;
+            app.hide();
+            assert_eq!(IsWindowVisible(app.copy_shortcut), 0);
+
             let mut area = RECT::default();
             app.show_preview_shortcut(Some(PreviewBadge::Stop), 560, 100, 96);
             assert_ne!(GetWindowRect(shortcut, &mut area), 0);
@@ -1888,10 +2423,7 @@ mod tests {
             }
             for badge in [PreviewBadge::Transcribing, PreviewBadge::Copying] {
                 app.indicator("A short transcript.", Some(badge));
-                assert_eq!(
-                    GetWindowLongPtrW(shortcut, GWLP_USERDATA),
-                    PreviewBadge::StopPending as isize
-                );
+                assert_eq!(GetWindowLongPtrW(shortcut, GWLP_USERDATA), badge as isize);
                 assert_eq!(GetWindowLongPtrW(pill, PILL_WELCOME_SLOT), 0);
                 let long_text = "This longer transcript should wrap in the preview. ".repeat(20);
                 app.indicator(&long_text, Some(badge));
@@ -1979,18 +2511,21 @@ mod tests {
                 .label(Some(Hotkey::default()), Locale::English),
             "STOP & COPY · CTRL+SHIFT+/"
         );
+        recording.started_at = now - CANCEL_WINDOW;
         let (clipboard, writes, feedback) = Clipboard::test_sink();
         let mut app = App {
             locale: Locale::English,
             hwnd: null_mut(),
             pill: null_mut(),
             preview_shortcut: null_mut(),
+            copy_shortcut: null_mut(),
             pill_font: None,
             icon: NOTIFYICONDATAW::default(),
             path: PathBuf::new(),
             binding: None,
             recording: Some(recording),
-            last_transcript: None,
+            hold: None,
+            last_transcript: Some("Prior transcript.".into()),
             recording_id: 1,
             completed_preview: None,
             status_until: None,
@@ -1998,7 +2533,14 @@ mod tests {
             copies_pending: VecDeque::new(),
             timer: false,
         };
-        app.activate_preview_shortcut(PreviewBadge::Stop as isize);
+        app.activate_preview_shortcut(PreviewBadge::CopyLast as isize);
+        assert_eq!(writes.try_recv().unwrap().text, "Prior transcript.");
+        feedback.send(ClipboardFeedback::Copied(17)).unwrap();
+
+        let press = Instant::now();
+        app.begin_hold(HoldInput::Button, press);
+        assert!(!app.recording.as_ref().unwrap().finishing);
+        app.activate_preview_shortcut(PreviewBadge::Holding as isize);
         assert_eq!(
             app.recording.as_ref().unwrap().preview_badge(),
             PreviewBadge::Transcribing
@@ -2018,32 +2560,57 @@ mod tests {
             .unwrap();
         app.tick();
         assert_eq!(
-            app.recording.as_ref().unwrap().preview_badge(),
-            PreviewBadge::SkipCleanup
+            app.recording
+                .as_ref()
+                .unwrap()
+                .preview_badge()
+                .label(Some(Hotkey::default()), Locale::English),
+            "Skip cleanup · CTRL+SHIFT+/"
         );
-        assert!(matches!(writes.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(writes.try_recv().unwrap().text, final_transcript);
         let before_final = Instant::now();
-        app.activate_preview_shortcut(PreviewBadge::SkipCleanup as isize);
+        app.dictation_key_pressed();
         assert_eq!(writes.try_recv().unwrap().text, final_transcript);
         assert_eq!(app.last_transcript.as_deref(), Some(final_transcript));
         assert_eq!(app.completed_preview, Some(PreviewBadge::Copying));
         let deadline = app.status_until.unwrap();
         assert!(deadline >= before_final + COMPLETED_PREVIEW_TIME);
         assert!(deadline <= Instant::now() + COMPLETED_PREVIEW_TIME);
-        app.copy_feedback(Some(0), ClipboardFeedback::Failed);
+        app.copy_feedback(CopyOrigin::Final(0), ClipboardFeedback::Failed);
+        feedback.send(ClipboardFeedback::Copied(29)).unwrap();
+        app.tick();
         assert_eq!(app.completed_preview, Some(PreviewBadge::Copying));
         feedback.send(ClipboardFeedback::Copied(29)).unwrap();
         app.tick();
         assert_eq!(app.completed_preview, Some(PreviewBadge::Copied));
-        assert_eq!(app.status_until, Some(deadline));
+        assert!(app.status_until.unwrap() >= deadline);
         assert!(matches!(writes.try_recv(), Err(TryRecvError::Empty)));
-        app.copy_feedback(Some(1), ClipboardFeedback::Failed);
+        app.copy_feedback(CopyOrigin::Final(1), ClipboardFeedback::Failed);
         assert_eq!(app.completed_preview, Some(PreviewBadge::CopyFailed));
-        assert_eq!(app.status_until, Some(deadline));
+        assert!(app.status_until.unwrap() >= deadline);
         app.status_until = Some(Instant::now());
         app.tick();
         assert!(app.completed_preview.is_none());
-        app.copy_feedback(Some(1), ClipboardFeedback::Copied(29));
+        app.copy_feedback(CopyOrigin::Final(1), ClipboardFeedback::Copied(29));
         assert!(app.status_until.is_none());
+
+        let (session, _send) = Session::test_channel();
+        app.recording = Some(Recording {
+            session,
+            started_at: now,
+            can_stop: true,
+            listening: true,
+            quiet: false,
+            finishing: false,
+            cleaning: false,
+            cleanup_error: None,
+            transcript: "This recording will be discarded.".into(),
+        });
+        app.begin_hold(HoldInput::Hotkey(Hotkey::default().key), now);
+        app.tick_hold(now + ABORT_HOLD);
+        assert!(app.hold.is_none());
+        assert!(app.recording.is_none());
+        assert_eq!(app.last_transcript.as_deref(), Some(final_transcript));
+        assert!(matches!(writes.try_recv(), Err(TryRecvError::Empty)));
     }
 }

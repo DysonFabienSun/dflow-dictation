@@ -28,6 +28,7 @@ const MAX_CHUNK_SECONDS: usize = 7;
 const MIN_CHUNK_MS: usize = 1_000;
 const PAUSE_MS: usize = 350;
 const SPEECH_FRAME_MS: usize = 20;
+const FINAL_SPEECH_MIN_MS: usize = 60;
 const MIN_SPEECH_ENERGY: f32 = 0.00001;
 const QUIET_FOR: Duration = Duration::from_secs(5);
 const MIN_AUDIO_PEAK: f32 = 0.001;
@@ -251,7 +252,7 @@ fn record(
         for samples in samples_rx.try_iter() {
             chunker.push(samples, &chunk_tx)?;
         }
-        chunker.flush(&chunk_tx)
+        chunker.finish(&chunk_tx)
     };
     if let Err(error) = capture() {
         report_failure(state, updates, error);
@@ -534,6 +535,19 @@ impl Chunker {
         self.samples.clear();
         result
     }
+
+    fn finish(&mut self, queue: &SyncSender<Vec<i16>>) -> Result<(), String> {
+        // A shortcut click can trip one energy frame in an otherwise quiet tail.
+        let required = self.rate * FINAL_SPEECH_MIN_MS / 1_000;
+        let mut voiced = 0;
+        if speech_frames(&self.samples, self.rate).any(|(active, len)| {
+            voiced = if active { voiced + len } else { 0 };
+            voiced >= required
+        }) {
+            self.flush(queue)?;
+        }
+        Ok(())
+    }
 }
 
 fn send_chunk(
@@ -565,10 +579,17 @@ fn send_chunk(
 }
 
 fn has_speech(samples: &[f32], rate: usize) -> bool {
+    speech_frames(samples, rate).any(|(active, _)| active)
+}
+
+fn speech_frames(samples: &[f32], rate: usize) -> impl Iterator<Item = (bool, usize)> {
     let frame_samples = (rate * SPEECH_FRAME_MS / 1_000).max(1);
-    samples.chunks(frame_samples).any(|frame| {
+    samples.chunks(frame_samples).map(|frame| {
         let energy = frame.iter().map(|sample| sample * sample).sum::<f32>();
-        energy >= MIN_SPEECH_ENERGY * frame.len() as f32
+        (
+            energy >= MIN_SPEECH_ENERGY * frame.len() as f32,
+            frame.len(),
+        )
     })
 }
 
@@ -697,11 +718,23 @@ mod tests {
         chunker.push(vec![0.0001; rate * 8], &queue).unwrap();
         assert_eq!(chunker.samples.len(), rate * 350 / 1_000);
         assert!(output.try_recv().is_err());
-        chunker.flush(&queue).unwrap();
+        chunker.finish(&queue).unwrap();
         assert!(output.try_recv().is_err());
 
+        let mut clicks = vec![0.0; rate / 2];
+        for start_ms in [100, 220, 390] {
+            // A loud click can straddle two analysis frames.
+            let start = rate * (start_ms - 1) / 1_000;
+            clicks[start..start + rate / 100].fill(0.5);
+        }
+        assert!(has_speech(&clicks, rate));
+        chunker.push(clicks, &queue).unwrap();
+        chunker.finish(&queue).unwrap();
+        assert!(output.try_recv().is_err());
+
+        let mut chunker = Chunker::new(rate, Locale::English);
         chunker.push(vec![0.03; rate / 5], &queue).unwrap();
-        chunker.flush(&queue).unwrap();
+        chunker.finish(&queue).unwrap();
         assert_eq!(output.try_recv().unwrap().len(), rate / 5);
     }
 
