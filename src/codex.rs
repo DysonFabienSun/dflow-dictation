@@ -1,4 +1,7 @@
-use crate::{config::Settings, locale::Locale};
+use crate::{
+    config::{ProxySettings, Settings},
+    locale::Locale,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{
     blocking::{Client, multipart},
@@ -6,23 +9,50 @@ use reqwest::{
 };
 use serde_json::Value;
 use std::{
-    fs,
+    env, fs,
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/transcribe";
 const ACCOUNT_CLAIM: &str = "https://api.openai.com/auth";
 
-struct Login {
-    access_token: String,
-    account_id: Option<String>,
+pub(crate) fn find_codex() -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    for dir in env::split_paths(&path).filter(|dir| dir.is_absolute()) {
+        let executable = dir.join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        if executable.is_file() {
+            return Some(executable);
+        }
+        #[cfg(windows)]
+        {
+            let (arch, target) = if cfg!(target_arch = "aarch64") {
+                ("arm64", "aarch64-pc-windows-msvc")
+            } else {
+                ("x64", "x86_64-pc-windows-msvc")
+            };
+            let npm = dir.join("node_modules/@openai");
+            let package = format!("codex-win32-{arch}/vendor/{target}/bin/codex.exe");
+            for root in [npm.join("codex/node_modules/@openai"), npm] {
+                let executable = root.join(&package);
+                if executable.is_file() {
+                    return Some(executable);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) struct Login {
+    pub access_token: String,
+    pub account_id: Option<String>,
     expiry: Option<u64>,
 }
 
-pub fn login_status(path: &Path, locale: Locale) -> Result<&'static str, String> {
-    let login = read_login(path, locale)?;
+pub fn login_status(settings: &Settings, locale: Locale) -> Result<&'static str, String> {
+    let login = settings_login(settings, locale)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -35,6 +65,11 @@ pub fn login_status(path: &Path, locale: Locale) -> Result<&'static str, String>
     } else {
         Ok(locale.text("ChatGPT login found.", "已找到 ChatGPT 登录信息"))
     }
+}
+
+pub(crate) fn settings_login(settings: &Settings, locale: Locale) -> Result<Login, String> {
+    settings.require_dictation(locale)?;
+    read_login(&settings.auth_file(locale)?, locale)
 }
 
 fn read_login(path: &Path, locale: Locale) -> Result<Login, String> {
@@ -107,27 +142,8 @@ pub struct Codex {
 
 impl Codex {
     pub fn new(settings: Settings, locale: Locale) -> Result<Self, String> {
-        let mut builder = Client::builder()
-            .no_proxy()
-            .redirect(redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(35));
-        if settings.proxy.enabled {
-            builder = builder.proxy(reqwest::Proxy::all(settings.proxy.url.as_str()).map_err(
-                |_| {
-                    locale.text(
-                        "Invalid proxy configuration. Check /proxy.",
-                        "代理配置无效，请检查网络代理设置",
-                    )
-                },
-            )?);
-        }
-        let client = builder.build().map_err(|_| {
-            locale.text(
-                "Could not initialize the HTTPS client.",
-                "无法初始化 HTTPS 客户端",
-            )
-        })?;
+        settings.require_dictation(locale)?;
+        let client = client(&settings.proxy, locale, Duration::from_secs(35))?;
         Ok(Self {
             client,
             settings,
@@ -136,10 +152,37 @@ impl Codex {
     }
 }
 
+pub(crate) fn client(
+    proxy: &ProxySettings,
+    locale: Locale,
+    timeout: Duration,
+) -> Result<Client, String> {
+    let mut builder = Client::builder()
+        .no_proxy()
+        .redirect(redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(timeout);
+    if proxy.enabled {
+        builder = builder.proxy(reqwest::Proxy::all(proxy.url.as_str()).map_err(|_| {
+            locale.text(
+                "Invalid proxy configuration. Check /proxy.",
+                "代理配置无效，请检查网络代理设置",
+            )
+        })?);
+    }
+    let client = builder.build().map_err(|_| {
+        locale.text(
+            "Could not initialize the HTTPS client.",
+            "无法初始化 HTTPS 客户端",
+        )
+    })?;
+    Ok(client)
+}
+
 impl Transcriber for Codex {
     fn transcribe(&mut self, wav: Vec<u8>) -> Result<String, String> {
         let locale = self.locale;
-        let login = read_login(&self.settings.auth_file(locale)?, locale)?;
+        let login = settings_login(&self.settings, locale)?;
         let part = multipart::Part::bytes(wav)
             .file_name("in.wav")
             .mime_str("audio/wav")

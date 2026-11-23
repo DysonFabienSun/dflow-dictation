@@ -1,6 +1,6 @@
 use crate::{
     codex::{Codex, Transcriber, login_status},
-    config::Settings,
+    config::{Config, Settings},
     locale::Locale,
     transcript::{Transcript, clean_text},
 };
@@ -10,6 +10,7 @@ use cpal::{
 };
 use std::{
     io::Cursor,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -68,6 +69,9 @@ pub enum Update {
     QuietInput(bool),
     Finishing,
     Transcript(String),
+    Cleaning,
+    Cleaned(String),
+    CleanupFailed(String),
     Done,
     Failed(String),
 }
@@ -78,12 +82,36 @@ pub struct Session {
 }
 
 impl Session {
+    pub fn test_dictation(mut settings: Settings, locale: Locale) -> Self {
+        settings.cleanup = false;
+        Self::start(settings, locale)
+    }
+
     pub fn start(settings: Settings, locale: Locale) -> Self {
+        Self::start_with(move || Ok(settings), locale)
+    }
+
+    pub fn start_from_config(path: PathBuf, locale: Locale) -> Self {
+        Self::start_with(
+            move || {
+                let config = Config::load_for(path, Some(locale));
+                config.error.map_or(Ok(config.settings), Err)
+            },
+            locale,
+        )
+    }
+
+    fn start_with(
+        settings: impl FnOnce() -> Result<Settings, String> + Send + 'static,
+        locale: Locale,
+    ) -> Self {
         let (updates, result) = mpsc::channel();
         let state = Arc::new(AtomicU8::new(RECORDING));
         let worker_state = Arc::clone(&state);
         thread::spawn(move || {
-            if let Err(error) = record(settings, &worker_state, &updates, locale) {
+            if let Err(error) =
+                settings().and_then(|settings| record(settings, &worker_state, &updates, locale))
+            {
                 report_failure(&worker_state, &updates, error);
             }
         });
@@ -119,7 +147,11 @@ fn record(
     updates: &Sender<Update>,
     locale: Locale,
 ) -> Result<(), String> {
-    login_status(&settings.auth_file(locale)?, locale)?;
+    if state.load(Ordering::Acquire) != RECORDING {
+        let _ = updates.send(Update::Done);
+        return Ok(());
+    }
+    login_status(&settings, locale)?;
     let host = cpal::default_host();
     let device = match settings.device.as_deref() {
         None => host.default_input_device().ok_or(locale.text(
@@ -167,8 +199,21 @@ fn record(
     let (chunk_tx, chunk_rx) = mpsc::sync_channel(8);
     let upload_updates = updates.clone();
     let upload_state = Arc::clone(state);
-    thread::spawn(move || match Codex::new(settings, locale) {
-        Ok(codex) => upload(codex, chunk_rx, &upload_updates, &upload_state, locale),
+    thread::spawn(move || match Codex::new(settings.clone(), locale) {
+        Ok(codex) => upload(
+            codex,
+            chunk_rx,
+            &upload_updates,
+            &upload_state,
+            locale,
+            |raw| {
+                complete_recording(settings.cleanup, raw, &upload_updates, |raw| {
+                    crate::cleanup::run(&settings, locale, raw, || {
+                        upload_state.load(Ordering::Acquire) == CANCELLED
+                    })
+                })
+            },
+        ),
         Err(error) => report_failure(&upload_state, &upload_updates, error),
     });
 
@@ -212,6 +257,21 @@ fn record(
         report_failure(state, updates, error);
     }
     Ok(())
+}
+
+fn complete_recording(
+    enabled: bool,
+    raw: &str,
+    updates: &Sender<Update>,
+    cleanup: impl FnOnce(&str) -> Result<String, String>,
+) -> Update {
+    if !enabled || raw.trim().is_empty() || updates.send(Update::Cleaning).is_err() {
+        return Update::Done;
+    }
+    match cleanup(raw) {
+        Ok(text) => Update::Cleaned(text),
+        Err(error) => Update::CleanupFailed(error),
+    }
 }
 
 struct InputMonitor {
@@ -258,6 +318,7 @@ fn upload(
     updates: &Sender<Update>,
     state: &AtomicU8,
     locale: Locale,
+    on_completed: impl FnOnce(&str) -> Update,
 ) {
     let mut transcript = Transcript::default();
     let mut previous = Vec::new();
@@ -300,7 +361,10 @@ fn upload(
         previous = current;
     }
     if state.load(Ordering::Acquire) != CANCELLED {
-        let _ = updates.send(Update::Done);
+        let completed = on_completed(transcript.text());
+        if state.load(Ordering::Acquire) != CANCELLED {
+            let _ = updates.send(completed);
+        }
     }
 }
 
@@ -529,9 +593,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recording_checks_consent_before_opening_the_login_file() {
+        for cloud_dictation in [None, Some(false)] {
+            let settings = Settings {
+                auth_path: Some(PathBuf::from("missing-auth.json")),
+                cloud_dictation,
+                ..Settings::default()
+            };
+            let session = Session::start(settings, Locale::English);
+            assert!(matches!(
+                session.updates.recv_timeout(Duration::from_secs(2)).unwrap(),
+                Update::Failed(error) if error.contains("Cloud dictation is off")
+            ));
+        }
+    }
+
+    #[test]
+    fn cleanup_is_called_once_for_successful_nonempty_opted_in_audio() {
+        let (updates, received) = mpsc::channel();
+        for (enabled, raw) in [(false, "some audio"), (true, " ")] {
+            assert!(matches!(
+                complete_recording(enabled, raw, &updates, |_| panic!("no turn expected")),
+                Update::Done
+            ));
+            assert!(received.try_recv().is_err());
+        }
+        let finish = complete_recording(true, "raw", &updates, |text| {
+            assert_eq!(text, "raw");
+            assert!(matches!(received.try_recv(), Ok(Update::Cleaning)));
+            Ok("clean".into())
+        });
+        assert!(matches!(finish, Update::Cleaned(text) if text == "clean"));
+        assert!(
+            matches!(complete_recording(true, "raw", &updates, |_| Err("rate limit".into())),
+            Update::CleanupFailed(error) if error == "rate limit")
+        );
+    }
+
+    #[test]
     fn missing_login_reports_an_error_in_the_session_language() {
         let directory = tempfile::tempdir().unwrap();
         let settings = Settings {
+            cloud_dictation: Some(true),
             auth_path: Some(directory.path().join("auth.json")),
             ..Settings::default()
         };
@@ -629,6 +732,7 @@ mod tests {
             &updates,
             &AtomicU8::new(STOPPING),
             Locale::English,
+            |_| Update::Done,
         );
         assert!(
             matches!(received.recv().unwrap(), Update::Transcript(text) if text == "First and second.")
@@ -735,6 +839,7 @@ mod tests {
                 &updates,
                 &AtomicU8::new(RECORDING),
                 Locale::English,
+                |_| Update::Done,
             )
         });
         let mut editor = Editor::default();

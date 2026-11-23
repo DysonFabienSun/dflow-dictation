@@ -16,6 +16,8 @@ pub struct Settings {
     pub device: Option<String>,
     pub hold_delay_ms: u32,
     pub auth_path: Option<PathBuf>,
+    pub cloud_dictation: Option<bool>,
+    pub cleanup: bool,
     pub proxy: ProxySettings,
 }
 
@@ -40,6 +42,8 @@ impl Default for Settings {
             device: None,
             hold_delay_ms: DEFAULT_HOLD_DELAY_MS,
             auth_path: None,
+            cloud_dictation: None,
+            cleanup: false,
             proxy: ProxySettings::default(),
         }
     }
@@ -97,6 +101,18 @@ pub fn parse_proxy_url(input: &str, locale: Locale) -> Result<reqwest::Url, Stri
 }
 
 impl Settings {
+    pub fn require_dictation(&self, locale: Locale) -> Result<(), String> {
+        if self.cloud_dictation == Some(true) {
+            return Ok(());
+        }
+        Err(locale
+            .text(
+                "Cloud dictation is off. Enable it in Dictation setup.",
+                "云端听写已关闭，请在听写设置中启用",
+            )
+            .into())
+    }
+
     pub fn auth_file(&self, locale: Locale) -> Result<PathBuf, String> {
         if let Some(path) = &self.auth_path {
             return Ok(path.clone());
@@ -288,6 +304,15 @@ impl Config {
             settings.auth_path.as_deref().and_then(Path::to_str),
         );
         document["transcription"]["provider"] = value("codex");
+        if let Some(enabled) = settings.cloud_dictation {
+            document["transcription"]["cloud_dictation"] = value(enabled);
+        } else if let Some(table) = document
+            .get_mut("transcription")
+            .and_then(Item::as_table_like_mut)
+        {
+            table.remove("cloud_dictation");
+        }
+        document["transcription"]["cleanup"] = value(settings.cleanup);
         document["proxy"]["url"] = value(settings.proxy.url.as_str());
         document["proxy"]["enabled"] = value(settings.proxy.enabled);
 
@@ -376,6 +401,8 @@ fn parse_settings(
             .transpose()?
             .unwrap_or(DEFAULT_HOLD_DELAY_MS),
         auth_path: string(transcription, "codex_auth_path", locale)?.map(PathBuf::from),
+        cloud_dictation: boolean(transcription, "cloud_dictation", locale)?,
+        cleanup: boolean(transcription, "cleanup", locale)?.unwrap_or(false),
         proxy: ProxySettings {
             url: parse_proxy_url(
                 string(proxy, "url", locale)?.unwrap_or(DEFAULT_PROXY),
@@ -423,6 +450,22 @@ fn table<'a>(
         .transpose()
 }
 
+fn boolean(
+    table: Option<&dyn toml_edit::TableLike>,
+    key: &str,
+    locale: Locale,
+) -> Result<Option<bool>, String> {
+    table
+        .and_then(|table| table.get(key))
+        .map(|item| {
+            item.as_bool().ok_or_else(|| match locale {
+                Locale::English => format!("{key} must be true or false."),
+                Locale::SimplifiedChinese => format!("{key} 必须是 true 或 false"),
+            })
+        })
+        .transpose()
+}
+
 fn string<'a>(
     table: Option<&'a dyn toml_edit::TableLike>,
     key: &str,
@@ -455,6 +498,45 @@ fn set_optional(doc: &mut DocumentMut, table: &str, key: &str, text: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrading_requires_consent_and_a_stale_choice_cannot_replace_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dflow.toml");
+        fs::write(&path, "[transcription]\nprovider = \"codex\"\nextra = 1\n").unwrap();
+        let mut scratchpad = Config::load(path.clone());
+        let mut tray = Config::load(path.clone());
+        assert_eq!(scratchpad.settings.cloud_dictation, None);
+        assert!(!scratchpad.settings.cleanup);
+        let decline = Settings {
+            cloud_dictation: Some(false),
+            ..scratchpad.settings.clone()
+        };
+        let accept = Settings {
+            cloud_dictation: Some(true),
+            ..tray.settings.clone()
+        };
+        scratchpad.save(decline).unwrap();
+        assert!(matches!(
+            tray.save(accept.clone()),
+            Err(SaveError::ChangedOnDisk)
+        ));
+        tray = Config::load(path.clone());
+        assert_eq!(tray.settings.cloud_dictation, Some(false));
+        tray.save(accept).unwrap();
+        let scratchpad = Config::load(path.clone());
+        assert_eq!(scratchpad.settings.cloud_dictation, Some(true));
+        assert!(!scratchpad.settings.cleanup);
+        assert!(fs::read_to_string(&path).unwrap().contains("extra = 1"));
+
+        let invalid = "[transcription]\ncloud_dictation = \"yes\"\n";
+        fs::write(&path, invalid).unwrap();
+        let mut config = Config::load(path.clone());
+        assert!(config.error.is_some());
+        assert!(config.settings.require_dictation(Locale::English).is_err());
+        assert!(config.save(config.settings.clone()).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), invalid);
+    }
 
     #[test]
     fn applications_share_config_only_in_the_same_directory() {

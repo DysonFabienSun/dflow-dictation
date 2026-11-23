@@ -51,6 +51,7 @@ const SETTINGS: u32 = 1;
 const CANCEL: u32 = 2;
 const COPY: u32 = 3;
 const EXIT: u32 = 4;
+const SETUP: u32 = 5;
 
 thread_local! {
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
@@ -83,6 +84,8 @@ struct Recording {
     listening: bool,
     quiet: bool,
     finishing: bool,
+    cleaning: bool,
+    cleanup_error: Option<String>,
     transcript: String,
 }
 
@@ -91,6 +94,7 @@ struct Recording {
 enum PreviewBadge {
     Cancel = 0,
     Stop = 1,
+    SkipCleanup,
     Dismiss,
     Transcribing,
     Copying,
@@ -112,6 +116,7 @@ impl PreviewBadge {
         let label = match self {
             Self::Cancel => locale.text("CANCEL", "取消"),
             Self::Stop | Self::StopPending => locale.text("STOP & COPY", "停止并复制"),
+            Self::SkipCleanup => locale.text("Cleaning up · Skip cleanup", "正在整理 · 跳过整理"),
             Self::Dismiss => locale.text("DISMISS", "关闭提示"),
             Self::Transcribing | Self::Copying => locale.text("Finishing…", "正在完成转写…"),
             Self::Copied => locale.text("Copied", "已复制"),
@@ -166,7 +171,9 @@ impl Recording {
     }
 
     fn preview_badge(&self) -> PreviewBadge {
-        if self.finishing {
+        if self.cleaning {
+            PreviewBadge::SkipCleanup
+        } else if self.finishing {
             PreviewBadge::Transcribing
         } else if self.can_stop {
             PreviewBadge::Stop
@@ -327,7 +334,7 @@ fn last_error() -> String {
     io::Error::last_os_error().to_string()
 }
 
-pub fn run(config: Config) -> Result<(), String> {
+pub fn run(mut config: Config) -> Result<(), String> {
     let locale = config.locale;
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -428,9 +435,30 @@ pub fn run(config: Config) -> Result<(), String> {
             )
             .into());
     }
+    if config.settings.cloud_dictation.is_none() {
+        match settings::ask_consent(hwnd, config.settings.proxy.clone(), locale) {
+            Ok(Some((enabled, proxy))) => {
+                let mut choice = config.settings.clone();
+                choice.cloud_dictation = Some(enabled);
+                choice.proxy = proxy;
+                match config.save(choice) {
+                    Ok(()) if enabled => {
+                        settings::open(hwnd, &config.path, &mut app.binding, locale, true)
+                    }
+                    Ok(()) => {}
+                    Err(error) => message(hwnd, &error.restart_message(&config), locale),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => message(hwnd, &error, locale),
+        }
+        config = Config::load_for(config.path.clone(), Some(locale));
+    }
     if let Some(error) = config.error.as_deref() {
         app.notice(error);
-    } else if let Some(binding) = app.binding {
+    } else if config.settings.cloud_dictation == Some(true)
+        && let Some(binding) = app.binding
+    {
         match config.tray_launch_preview() {
             Ok(true) => app.show_launch_preview(binding.hotkey),
             Ok(false) => {}
@@ -834,6 +862,8 @@ fn draw_preview_shortcut(hwnd: HWND, dc: HDC) {
         let dpi = GetDpiForWindow(hwnd).max(96) as i32;
         let alignment = if action == PreviewBadge::Dismiss as isize
             || action == PreviewBadge::Copied as isize
+            || action == PreviewBadge::Transcribing as isize
+            || action == PreviewBadge::Copying as isize
         {
             DT_CENTER
         } else {
@@ -906,18 +936,15 @@ impl App {
         } else {
             self.hide();
             self.recording_id += 1;
-            let config = Config::load_for(self.path.clone(), Some(self.locale));
-            if let Some(error) = config.error {
-                self.notice(&error);
-                return;
-            }
             self.recording = Some(Recording {
-                session: Session::start(config.settings, self.locale),
+                session: Session::start_from_config(self.path.clone(), self.locale),
                 started_at: Instant::now(),
                 can_stop: false,
                 listening: false,
                 quiet: false,
                 finishing: false,
+                cleaning: false,
+                cleanup_error: None,
                 transcript: String::new(),
             });
             self.recording_status();
@@ -944,6 +971,16 @@ impl App {
     }
 
     fn activate_preview_shortcut(&mut self, action: isize) {
+        if action == PreviewBadge::SkipCleanup as isize {
+            if self
+                .recording
+                .as_ref()
+                .is_some_and(|recording| recording.cleaning)
+            {
+                self.finish_recording();
+            }
+            return;
+        }
         if action == PreviewBadge::Dismiss as isize {
             if self.recording.is_none()
                 && !self.preview_shortcut.is_null()
@@ -998,31 +1035,21 @@ impl App {
                     recording.transcript = text;
                     redraw = true;
                 }
-                Ok(Update::Done) => {
-                    let recording = self.recording.take().unwrap();
-                    if recording.transcript.trim().is_empty() {
-                        self.notice_for(
-                            self.locale.text("No speech detected.", "未检测到语音"),
-                            Duration::from_secs(1),
-                        );
-                    } else {
-                        self.completed_preview = Some(PreviewBadge::Copying);
-                        self.indicator(&recording.transcript, self.completed_preview);
-                        if !self.pill.is_null() {
-                            unsafe {
-                                RedrawWindow(
-                                    self.pill,
-                                    null(),
-                                    null_mut(),
-                                    RDW_INVALIDATE | RDW_UPDATENOW,
-                                );
-                            }
-                        }
-                        self.status_until = Some(Instant::now() + COMPLETED_PREVIEW_TIME);
-                        self.last_transcript = Some(recording.transcript);
-                        self.copy_last_transcript(Some(self.recording_id));
-                    }
+                Ok(Update::Cleaning) => {
+                    recording.cleaning = true;
+                    recording.finishing = true;
+                    redraw = true;
+                    break;
                 }
+                Ok(Update::Cleaned(text)) => {
+                    recording.transcript = text;
+                    self.finish_recording();
+                }
+                Ok(Update::CleanupFailed(error)) => {
+                    recording.cleanup_error = Some(error);
+                    self.finish_recording();
+                }
+                Ok(Update::Done) => self.finish_recording(),
                 Ok(Update::Failed(error)) => self.fail(&error),
                 Err(TryRecvError::Disconnected) => self.fail(
                     self.locale
@@ -1059,6 +1086,41 @@ impl App {
                 }
             }
         }
+    }
+
+    fn finish_recording(&mut self) {
+        let Some(recording) = self.recording.take() else {
+            return;
+        };
+        drop(recording.session);
+        if recording.transcript.trim().is_empty() {
+            self.notice_for(
+                self.locale.text("No speech detected.", "未检测到语音"),
+                Duration::from_secs(1),
+            );
+            return;
+        }
+        self.completed_preview = Some(PreviewBadge::Copying);
+        let preview = recording
+            .cleanup_error
+            .map(|error| format!("{}\n{error}", recording.transcript));
+        self.indicator(
+            preview.as_deref().unwrap_or(&recording.transcript),
+            self.completed_preview,
+        );
+        if !self.pill.is_null() {
+            unsafe {
+                RedrawWindow(
+                    self.pill,
+                    null(),
+                    null_mut(),
+                    RDW_INVALIDATE | RDW_UPDATENOW,
+                )
+            };
+        }
+        self.status_until = Some(Instant::now() + COMPLETED_PREVIEW_TIME);
+        self.last_transcript = Some(recording.transcript);
+        self.copy_last_transcript(Some(self.recording_id));
     }
 
     fn copy_feedback(&mut self, origin: Option<u64>, feedback: ClipboardFeedback) {
@@ -1127,8 +1189,21 @@ impl App {
                 self.recording.is_none(),
             ),
             (
+                SETUP,
+                self.locale.text("Dictation setup", "听写设置"),
+                self.recording.is_none(),
+            ),
+            (
                 CANCEL,
-                self.locale.text("Cancel recording", "取消录音"),
+                if self
+                    .recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.cleaning)
+                {
+                    self.locale.text("Skip cleanup", "跳过整理")
+                } else {
+                    self.locale.text("Cancel recording", "取消录音")
+                },
                 self.recording.is_some(),
             ),
             (
@@ -1165,7 +1240,7 @@ impl App {
             command as u32
         };
         match command {
-            SETTINGS => {
+            SETTINGS | SETUP => {
                 if !self.preview_shortcut.is_null()
                     && unsafe {
                         GetWindowLongPtrW(self.preview_shortcut, GWLP_USERDATA)
@@ -1175,11 +1250,25 @@ impl App {
                 {
                     self.hide();
                 }
-                settings::open(self.hwnd, &self.path, &mut self.binding, self.locale);
+                settings::open(
+                    self.hwnd,
+                    &self.path,
+                    &mut self.binding,
+                    self.locale,
+                    command == SETUP,
+                );
                 self.set_tooltip();
                 unsafe {
                     Shell_NotifyIconW(NIM_MODIFY, &self.icon);
                 }
+            }
+            CANCEL
+                if self
+                    .recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.cleaning) =>
+            {
+                self.finish_recording()
             }
             CANCEL => self.cancel_recording(),
             COPY => self.copy_last_transcript(None),
@@ -1309,7 +1398,7 @@ impl App {
         };
         let hotkey = self.binding.map(|binding| binding.hotkey);
         let label = wide(&badge.label(hotkey, self.locale));
-        let sizing_label = if badge == PreviewBadge::Dismiss {
+        let sizing_label = if matches!(badge, PreviewBadge::Dismiss | PreviewBadge::SkipCleanup) {
             label.clone()
         } else {
             wide(&PreviewBadge::Stop.label(hotkey, self.locale))
@@ -1638,6 +1727,17 @@ mod tests {
             let left = GetPixel(dc, 10, 8);
             let right_has_text = (0..SHORTCUT_HEIGHT)
                 .any(|y| ((width - 120)..(width - 9)).any(|x| GetPixel(dc, x, y) != background));
+            for badge in [PreviewBadge::Transcribing, PreviewBadge::Copying] {
+                SetWindowLongPtrW(shortcut, GWLP_USERDATA, badge as isize);
+                SetWindowTextW(shortcut, wide(&badge.label(None, Locale::English)).as_ptr());
+                SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+                let mut ink = (0..width)
+                    .filter(|&x| (0..SHORTCUT_HEIGHT).any(|y| GetPixel(dc, x, y) != background));
+                let first = ink.next().unwrap();
+                let last = ink.last().unwrap();
+                assert!((first + last - width).abs() <= 4);
+            }
+            SetWindowLongPtrW(shortcut, GWLP_USERDATA, PreviewBadge::Cancel as isize);
             assert_eq!(
                 SendMessageW(shortcut, WM_MOUSEACTIVATE, 0, 0),
                 MA_NOACTIVATE as LRESULT
@@ -1846,6 +1946,8 @@ mod tests {
             listening: true,
             quiet: false,
             finishing: false,
+            cleaning: false,
+            cleanup_error: None,
             transcript: String::new(),
         };
         assert_eq!(
@@ -1911,9 +2013,17 @@ mod tests {
         let final_transcript = "Meet Tuesday.\nBring the notes.";
         send.send(Update::Transcript(final_transcript.into()))
             .unwrap();
-        send.send(Update::Done).unwrap();
-        let before_final = Instant::now();
+        send.send(Update::Cleaning).unwrap();
+        send.send(Update::Cleaned("Late cleanup output.".into()))
+            .unwrap();
         app.tick();
+        assert_eq!(
+            app.recording.as_ref().unwrap().preview_badge(),
+            PreviewBadge::SkipCleanup
+        );
+        assert!(matches!(writes.try_recv(), Err(TryRecvError::Empty)));
+        let before_final = Instant::now();
+        app.activate_preview_shortcut(PreviewBadge::SkipCleanup as isize);
         assert_eq!(writes.try_recv().unwrap().text, final_transcript);
         assert_eq!(app.last_transcript.as_deref(), Some(final_transcript));
         assert_eq!(app.completed_preview, Some(PreviewBadge::Copying));

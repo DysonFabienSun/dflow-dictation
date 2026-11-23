@@ -6,7 +6,7 @@ mod terminal_input;
 mod ui;
 
 use dflow_scratchpad::{
-    audio, clipboard, codex,
+    audio, clipboard,
     config::{self, Config},
     editor,
     locale::Locale,
@@ -121,6 +121,7 @@ fn run(config: Config, agent_access: bool) -> io::Result<()> {
         .join("cache")
         .join("note.json");
     let mut app = app::App::new(config);
+    app.onboard();
     match cache::CachedNote::load(&cache_path) {
         Ok(note) => app.editor = note.into_editor(),
         Err(_) => {

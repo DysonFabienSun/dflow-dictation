@@ -7,8 +7,18 @@ Download either or both executables under **Assets** and save them to a writable
 
 If you used `dflow-tray.exe`, launch `dflow-dictation.exe` instead and re-enable **Start with Windows** in its Settings if you used that option.
 
+## Set up cloud dictation
+
+Install Codex CLI, run `codex login` with your ChatGPT account, and allow Windows microphone access. On first launch, choose **Enable cloud dictation** to use that sign-in and send audio to OpenAI at `chatgpt.com`. Choose **Continue without dictation** to use the scratchpad for local editing.
+
+Open **Dictation setup** to check sign-in, choose a microphone, and run an optional test recording. The proxy starts disabled. Use **ChatGPT Voice Dictionary** to add or remove entries for your account. Changes also affect dictation in ChatGPT.
+
+**Clean up after dictation** is off by default and needs a current Codex CLI on PATH. Each cleanup runs one GPT-6 Luna request and uses additional tokens from your ChatGPT plan’s Codex allowance. The amount varies with the transcript and vocabulary. Applicable credits or billing may apply. [Codex usage and billing](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan)
+
+Transcription and Voice Dictionary management depend on private ChatGPT endpoints and account access.
+
 ## Use the two apps together
 
-Both apps use your existing Codex CLI login for dictation and can run independently. Keep the executables in the same folder to share microphone, Codex auth, and proxy settings through `config/dflow.toml`. Separate folders keep settings independent. The tray reads the shared dictation settings before each recording. Restart the scratchpad after changing shared settings in the tray.
+Both apps can run independently. Keep the executables in the same folder to share consent, microphone, Codex login path, proxy, and cleanup settings through `config/dflow.toml`. Both apps read the shared settings before each recording.
 
 The scratchpad note and tray transcript are separate. To move a tray transcript into the scratchpad, use **Copy last transcript** and paste it into the note.

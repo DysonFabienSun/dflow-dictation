@@ -1,8 +1,11 @@
 pub mod audio;
+mod cleanup;
 pub mod clipboard;
 pub mod codex;
 pub mod config;
+pub mod dictionary;
 pub mod editor;
 pub mod hotkey;
 pub mod locale;
+pub mod setup;
 pub mod transcript;

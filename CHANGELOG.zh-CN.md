@@ -2,6 +2,24 @@
 
 [使用指南](README.zh-CN.md) · [GitHub 发布页](https://github.com/DysonFabienSun/dflow-dictation/releases)
 
+<a name="release-v0.5.0"></a>
+
+## v0.5.0
+
+### 新功能
+
+- 两款应用在首次启动或从旧版本升级后，请用户选择是否启用云端听写。选择暂不启用后，仍可在便签中编辑文字。
+- 两款应用均可从设置打开**听写设置**。启用前可检查 ChatGPT 连接、Codex CLI 和代理。启用后可测试麦克风和转写，结果只显示在设置中。
+- 在 **ChatGPT 语音词典**中查看、添加或移除词条。更改会同步用于 ChatGPT 中的听写。
+- 新增可选的**听写后自动整理**，由 GPT-6 Luna 修正标点和明显的转写错误。此功能默认关闭，启用后会额外使用 Codex 额度。跳过整理或整理失败时保留原始转写。
+
+### 改进
+
+- DFlow Scratchpad 将听写和整理合并为一次撤销。DFlow Dictation 只复制一次最终结果，并将「正在完成转写」提示居中显示。
+- 英文和简体中文使用指南，以及发布页的快速上手说明，补充了听写授权、代理检查、词典和整理用量。
+
+[查看完整变更](https://github.com/DysonFabienSun/dflow-dictation/compare/v0.4.0...v0.5.0)
+
 <a name="release-v0.4.0"></a>
 
 ## v0.4.0

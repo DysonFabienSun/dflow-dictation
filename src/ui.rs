@@ -210,9 +210,10 @@ fn menu_lines(menu: &Menu, width: u16, height: u16, locale: Locale) -> Vec<Line<
     lines.extend(
         menu.context
             .iter()
+            .filter(|line| !line.is_empty())
+            .flat_map(|line| note_rows(line, width as usize))
             .take(context_capacity)
-            .cloned()
-            .map(|line| Line::styled(line, SECONDARY)),
+            .map(|line| Line::styled(line.text, SECONDARY)),
     );
     let available = (height as usize)
         .saturating_sub(lines.len() + usize::from(narrow))
@@ -223,7 +224,12 @@ fn menu_lines(menu: &Menu, width: u16, height: u16, locale: Locale) -> Vec<Line<
         .map(|row| row.name.width())
         .max()
         .unwrap_or(0)
-        .min(24);
+        .min(width.saturating_sub(4) as usize)
+        .min(if visible.iter().any(|row| !row.detail.is_empty()) {
+            (width as usize * 2 / 3).max(25)
+        } else {
+            width as usize
+        });
     for (index, row) in visible.iter().enumerate().skip(first).take(available) {
         let active = index == menu.selected;
         let mut spans = vec![Span::styled(if active { "› " } else { "  " }, ACCENT)];
@@ -237,7 +243,13 @@ fn menu_lines(menu: &Menu, width: u16, height: u16, locale: Locale) -> Vec<Line<
         );
         spans.push(Span::styled(
             name.to_owned(),
-            if active { SELECTED } else { Style::default() },
+            if active {
+                SELECTED
+            } else if row.emphasized() {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            },
         ));
         if !narrow && !row.detail.is_empty() {
             spans.push(Span::raw(

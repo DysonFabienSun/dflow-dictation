@@ -2,7 +2,6 @@ use crate::{
     agent::{AgentResult, Command, Error, Reply},
     audio::{self, InputDevice, Session, Update},
     clipboard::{Clipboard, ClipboardFeedback},
-    codex::login_status,
     config::{Config, ProxySettings, parse_proxy_url},
     editor::{BurstKind, Editor, Movement},
     transcript::clean_text,
@@ -10,7 +9,11 @@ use crate::{
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use dflow_scratchpad::locale::{Language, Locale};
+use dflow_scratchpad::{
+    dictionary::Change,
+    locale::{Language, Locale},
+    setup::{self, NetworkCheck, NetworkTarget, Setup},
+};
 use ratatui::layout::{Position, Rect};
 use std::{
     ops::Range,
@@ -30,11 +33,23 @@ enum Action {
     Undo,
     Redo,
     Settings,
+    Setup,
+    SetConsent(bool),
+    ToggleCleanup,
+    TestDictation,
+    Dictionary,
+    ReloadDictionary,
+    AddDictionaryEntry,
+    SaveDictionaryEntry(String),
+    RemoveDictionaryEntry(String),
+    ConfirmDictionaryRemoval(String),
     Devices,
     Language,
     SetLanguage(Language),
     Provider,
     Proxy,
+    CheckChatGpt,
+    CheckProxy,
     SetProxyEnabled(bool),
     EditProxyUrl,
     SaveProxyUrl(String),
@@ -54,6 +69,10 @@ pub struct Row {
 }
 
 impl Row {
+    pub fn emphasized(&self) -> bool {
+        matches!(self.action, Action::SetConsent(true))
+    }
+
     fn new(name: impl Into<String>, detail: impl Into<String>, action: Action) -> Self {
         Self {
             name: name.into(),
@@ -67,6 +86,9 @@ impl Row {
 enum MenuKind {
     Commands,
     Settings,
+    Setup,
+    Dictionary,
+    ConfirmRemoval,
     Devices,
     Language,
     Provider,
@@ -161,6 +183,7 @@ pub enum Pane {
 pub enum InputKind {
     AuthPath,
     ProxyUrl,
+    DictionaryEntry,
 }
 
 impl InputKind {
@@ -177,6 +200,10 @@ impl InputKind {
                     "http://、https:// 或 socks5://",
                 ),
             ),
+            Self::DictionaryEntry => (
+                locale.text("Add dictionary entry", "添加词条"),
+                locale.text("Canonical word or phrase", "标准写法或短语"),
+            ),
         }
     }
 }
@@ -191,6 +218,7 @@ impl Pane {
                 KeyCode::Enter => Some(match kind {
                     InputKind::AuthPath => Action::SaveAuthPath(text.clone()),
                     InputKind::ProxyUrl => Action::SaveProxyUrl(text.clone()),
+                    InputKind::DictionaryEntry => Action::SaveDictionaryEntry(text.clone()),
                 }),
                 KeyCode::Backspace => {
                     text.pop();
@@ -211,6 +239,7 @@ enum DictationPhase {
     Pending,
     Live { quiet: bool },
     Finishing,
+    Cleaning,
 }
 
 struct Dictation {
@@ -257,6 +286,8 @@ pub struct App {
     clipboard: Clipboard,
     pending_cut: Option<PendingCut>,
     device_scan: Option<Receiver<DeviceList>>,
+    setup: Setup,
+    network: NetworkCheck,
     dictation: Option<Dictation>,
     space_down: bool,
     mouse_selecting: bool,
@@ -286,6 +317,8 @@ impl App {
             clipboard: Clipboard::new(),
             pending_cut: None,
             device_scan: None,
+            setup: Setup::default(),
+            network: NetworkCheck::default(),
             dictation: None,
             space_down: false,
             mouse_selecting: false,
@@ -349,6 +382,13 @@ impl App {
                     ),
                     false,
                 ),
+                DictationPhase::Cleaning => (
+                    locale.text(
+                        "Cleaning up… · Esc skip cleanup",
+                        "正在整理… · Esc 跳过整理",
+                    ),
+                    false,
+                ),
             };
         }
         if let Some(notice) = &self.notice {
@@ -398,6 +438,14 @@ impl App {
         let locale = self.locale;
         let now = Instant::now();
         let mut redraw = self.poll_devices();
+        if self.setup.poll(locale) {
+            self.refresh_setup_menu();
+            redraw = true;
+        }
+        if self.network.poll(locale) {
+            self.refresh_setup_menu();
+            redraw = true;
+        }
         if let Some(cut) = &mut self.pending_cut {
             match cut.reply.try_recv() {
                 Ok(feedback) => {
@@ -477,6 +525,19 @@ impl App {
                     self.note_changed(changed);
                 }
                 Update::Done => self.end(),
+                Update::Cleaning => {
+                    dictation.phase = DictationPhase::Cleaning;
+                    break;
+                }
+                Update::Cleaned(text) => {
+                    let changed = self.editor.transcript(&mut dictation.range, &text);
+                    self.note_changed(changed);
+                    self.end();
+                }
+                Update::CleanupFailed(error) => {
+                    self.notice = Some(error);
+                    self.end();
+                }
                 Update::Failed(error) => {
                     self.end();
                     self.notice = Some(error);
@@ -707,10 +768,7 @@ impl App {
             KeyCode::Char('z') if self.panes.is_empty() => self.perform(Action::Undo),
             KeyCode::Char('y') if self.panes.is_empty() => self.perform(Action::Redo),
             KeyCode::Char(' ')
-                if self.panes.is_empty()
-                    && !self.space_down
-                    && key.kind == KeyEventKind::Press
-                    && self.config.error.is_none() =>
+                if self.panes.is_empty() && !self.space_down && key.kind == KeyEventKind::Press =>
             {
                 self.notice = None;
                 self.space_down = true;
@@ -730,7 +788,7 @@ impl App {
         self.editor.clear_selection();
         self.editor.begin();
         self.dictation = Some(Dictation {
-            session: Session::start(self.config.settings.clone(), self.locale),
+            session: Session::start_from_config(self.config.path.clone(), self.locale),
             gesture: SpaceGesture::Pressing(pressed),
             phase: DictationPhase::Pending,
             range: cursor..cursor,
@@ -905,6 +963,14 @@ impl App {
         let locale = self.locale;
         if matches!(action, Action::Back) {
             self.panes.pop();
+            if !self
+                .panes
+                .iter()
+                .any(|pane| matches!(pane, Pane::Menu(menu) if menu.kind == MenuKind::Setup))
+            {
+                self.setup = Setup::default();
+            }
+            self.refresh_setup_menu();
             return;
         }
         if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.query.is_some()) {
@@ -931,12 +997,114 @@ impl App {
                 let changed = self.editor.lowercase();
                 self.note_changed(changed);
             }
-            Action::Settings => self.open_settings(),
+            Action::Settings => {
+                self.config = Config::load_for(self.config.path.clone(), Some(locale));
+                self.open_settings();
+            }
+            Action::Setup => self.open_setup(),
+            Action::SetConsent(enabled) => {
+                let mut settings = self.config.settings.clone();
+                let first_choice = settings.cloud_dictation.is_none();
+                settings.cloud_dictation = Some(enabled);
+                match self.config.save(settings) {
+                    Ok(()) => {
+                        self.setup = Setup::default();
+                        if enabled {
+                            self.setup.check_login(self.config.settings.clone(), locale);
+                        }
+                        if !enabled && first_choice {
+                            self.panes.pop();
+                        } else {
+                            self.panes.pop();
+                            self.panes.push(Pane::Menu(self.setup_menu()));
+                        }
+                    }
+                    Err(error) => self.notice = Some(error.restart_message(&self.config)),
+                }
+            }
+            Action::ToggleCleanup => {
+                let mut settings = self.config.settings.clone();
+                if let Err(error) = settings.require_dictation(locale) {
+                    self.notice = Some(error);
+                    return;
+                }
+                settings.cleanup = !settings.cleanup;
+                match self.config.save(settings) {
+                    Ok(()) => self.refresh_setup_menu(),
+                    Err(error) => self.notice = Some(error.restart_message(&self.config)),
+                }
+            }
+            Action::TestDictation => {
+                let current = Config::load_for(self.config.path.clone(), Some(locale));
+                if let Err(error) = current
+                    .error
+                    .map_or_else(|| current.settings.require_dictation(locale), Err)
+                {
+                    self.notice = Some(error);
+                } else {
+                    self.setup.test(current.settings, locale);
+                    self.refresh_setup_menu();
+                }
+            }
+            Action::Dictionary => {
+                self.dictionary_work(None);
+                self.panes.push(Pane::Menu(self.dictionary_menu()));
+            }
+            Action::ReloadDictionary => self.dictionary_work(None),
+            Action::AddDictionaryEntry => self.panes.push(Pane::TextInput {
+                kind: InputKind::DictionaryEntry,
+                text: String::new(),
+            }),
+            Action::SaveDictionaryEntry(text) => {
+                self.panes.pop();
+                self.dictionary_work(Some(Change::Add(text)));
+            }
+            Action::RemoveDictionaryEntry(id) => {
+                if let Some(entry) = self
+                    .setup
+                    .dictionary
+                    .as_ref()
+                    .and_then(|dictionary| dictionary.words.iter().find(|entry| entry.id == id))
+                {
+                    self.panes.push(Pane::Menu(Menu {
+                        kind: MenuKind::ConfirmRemoval,
+                        title: locale.text("Remove dictionary entry", "移除词条"),
+                        context: vec![
+                            entry.text.clone(),
+                            setup::dictionary_disclosure(locale).into(),
+                        ],
+                        query: None,
+                        selected: 0,
+                        rows: vec![
+                            Row::new(locale.text("Back", "返回"), "", Action::Back),
+                            Row::new(
+                                locale.text("Remove entry", "移除词条"),
+                                "",
+                                Action::ConfirmDictionaryRemoval(id),
+                            ),
+                        ],
+                    }));
+                }
+            }
+            Action::ConfirmDictionaryRemoval(id) => {
+                self.panes.pop();
+                self.dictionary_work(Some(Change::Remove(id)));
+            }
             Action::Devices => self.open_devices(),
             Action::Language => self.open_language(),
             Action::SetLanguage(language) => self.set_language(language),
             Action::Provider => self.open_provider(),
             Action::Proxy => self.open_proxy(),
+            Action::CheckChatGpt | Action::CheckProxy => {
+                let target = if matches!(action, Action::CheckProxy) {
+                    NetworkTarget::Proxy
+                } else {
+                    NetworkTarget::ChatGpt
+                };
+                self.network
+                    .start(self.config.settings.proxy.clone(), target, locale);
+                self.refresh_setup_menu();
+            }
             Action::SetProxyEnabled(enabled) => {
                 let mut proxy = self.config.settings.proxy.clone();
                 proxy.enabled = enabled;
@@ -991,10 +1159,7 @@ impl App {
             Action::SaveAuthPath(path) => {
                 let path = PathBuf::from(path.trim());
                 if path.is_absolute() {
-                    match login_status(&path, locale) {
-                        Ok(_) => self.save_auth(Some(path), true),
-                        Err(error) => self.notice = Some(error),
-                    }
+                    self.save_auth(Some(path), true);
                 } else {
                     self.notice = Some(
                         locale
@@ -1030,6 +1195,7 @@ impl App {
         settings.proxy = proxy;
         match self.config.save(settings) {
             Ok(()) => {
+                self.network = NetworkCheck::default();
                 if editing {
                     self.panes.pop();
                 }
@@ -1039,6 +1205,7 @@ impl App {
                     self.refresh_settings_menu();
                     self.open_proxy();
                 } else {
+                    self.refresh_setup_menu();
                     self.notice = Some(if self.config.settings.proxy.enabled {
                         locale
                             .text("Proxy enabled for Codex.", "已启用网络代理")
@@ -1058,6 +1225,10 @@ impl App {
     }
 
     fn open_proxy(&mut self) {
+        self.panes.push(Pane::Menu(self.proxy_menu()));
+    }
+
+    fn proxy_menu(&self) -> Menu {
         let locale = self.locale;
         let proxy = &self.config.settings.proxy;
         let status = if proxy.enabled {
@@ -1076,15 +1247,15 @@ impl App {
                 locale.text("Use this proxy for Codex", "使用此代理连接 ChatGPT"),
             )
         };
-        self.panes.push(Pane::Menu(Menu {
+        Menu {
             kind: MenuKind::Proxy,
             title: locale.text("Proxy", "网络代理"),
             query: None,
             selected: 0,
-            context: vec![format!(
-                "{status} · {}",
-                proxy.url.as_str().trim_end_matches('/')
-            )],
+            context: vec![
+                format!("{status} · {}", proxy.url.as_str().trim_end_matches('/')),
+                self.network.status.clone(),
+            ],
             rows: vec![
                 Row::new(
                     locale.text("Edit address", "修改地址"),
@@ -1092,17 +1263,229 @@ impl App {
                     Action::EditProxyUrl,
                 ),
                 Row::new(label, detail, Action::SetProxyEnabled(!proxy.enabled)),
+                Row::new(NetworkTarget::Proxy.label(locale), "", Action::CheckProxy),
             ],
-        }));
+        }
     }
 
     fn refresh_settings_menu(&mut self) {
+        self.refresh_setup_menu();
         if matches!(self.panes.last(), Some(Pane::Menu(menu)) if menu.kind == MenuKind::Settings) {
             let old = self.panes.pop();
             self.open_settings();
             if let (Some(Pane::Menu(old)), Some(Pane::Menu(new))) = (old, self.panes.last_mut()) {
                 new.selected = old.selected;
             }
+        }
+    }
+
+    pub fn onboard(&mut self) {
+        if self.config.settings.cloud_dictation.is_none() {
+            self.open_setup();
+        }
+    }
+
+    fn open_setup(&mut self) {
+        self.config = Config::load_for(self.config.path.clone(), Some(self.locale));
+        self.setup = Setup::default();
+        if self.config.settings.cloud_dictation == Some(true) {
+            self.setup
+                .check_login(self.config.settings.clone(), self.locale);
+        }
+        self.panes.push(Pane::Menu(self.setup_menu()));
+    }
+
+    fn refresh_setup_menu(&mut self) {
+        let Some(Pane::Menu(menu)) = self.panes.last() else {
+            return;
+        };
+        let selected = menu.selected;
+        let mut updated = match menu.kind {
+            MenuKind::Setup => self.setup_menu(),
+            MenuKind::Dictionary => self.dictionary_menu(),
+            MenuKind::Provider => self.provider_menu(),
+            MenuKind::Proxy => self.proxy_menu(),
+            _ => return,
+        };
+        updated.selected = selected.min(updated.rows.len().saturating_sub(1));
+        *self.panes.last_mut().unwrap() = Pane::Menu(updated);
+    }
+
+    fn setup_menu(&self) -> Menu {
+        let locale = self.locale;
+        let settings = &self.config.settings;
+        let enabled = settings.cloud_dictation == Some(true);
+        let mut context = vec![setup::consent_text(locale).into()];
+        if !enabled {
+            context.push(setup::availability_hint(locale).into());
+        }
+        if !self.network.status.is_empty() {
+            context.push(self.network.status.clone());
+        }
+        if enabled {
+            context.push(setup::cleanup_disclosure(locale).into());
+        }
+        if let Some(error) = &self.config.error {
+            context.push(error.clone());
+        }
+        if !self.setup.login.is_empty() {
+            context.push(self.setup.login.clone());
+        }
+        if !self.setup.test_result.is_empty() {
+            context.push(format!(
+                "{} · {}",
+                locale.text("Test dictation", "听写测试"),
+                self.setup.test_result
+            ));
+        }
+        let mut rows = Vec::new();
+        if self.setup.testing() {
+            if !self.setup.stopping() {
+                rows.push(Row::new(
+                    locale.text("Stop test recording", "停止测试录音"),
+                    "",
+                    Action::TestDictation,
+                ));
+            }
+            rows.push(Row::new(
+                locale.text("Close setup", "关闭听写设置"),
+                "",
+                Action::Back,
+            ));
+        } else if enabled {
+            rows.extend([
+                Row::new(
+                    locale.text("Test dictation", "测试听写"),
+                    locale.text("Optional · result stays here", "可跳过 · 结果仅在此显示"),
+                    Action::TestDictation,
+                ),
+                Row::new(
+                    locale.text("Clean up after dictation", "听写后自动整理"),
+                    if settings.cleanup {
+                        locale.text("On", "已启用")
+                    } else {
+                        locale.text("Off", "已关闭")
+                    },
+                    Action::ToggleCleanup,
+                ),
+                Row::new(
+                    locale.text("Microphone", "麦克风"),
+                    settings
+                        .device
+                        .as_deref()
+                        .unwrap_or(locale.text("System default", "系统默认")),
+                    Action::Devices,
+                ),
+                Row::new(
+                    locale.text("Codex sign-in", "Codex 登录"),
+                    "",
+                    Action::Provider,
+                ),
+                Row::new(
+                    locale.text("ChatGPT Voice Dictionary", "ChatGPT 语音词典"),
+                    "",
+                    Action::Dictionary,
+                ),
+                Row::new(
+                    locale.text("Disable cloud dictation", "关闭云端听写"),
+                    "",
+                    Action::SetConsent(false),
+                ),
+                Row::new(locale.text("Close setup", "关闭听写设置"), "", Action::Back),
+            ]);
+        } else {
+            rows.push(Row::new(
+                locale.text("Enable cloud dictation", "启用云端听写"),
+                "",
+                Action::SetConsent(true),
+            ));
+            if settings.cloud_dictation.is_none() {
+                rows.push(Row::new(
+                    locale.text("Continue without dictation", "继续使用，暂不启用听写"),
+                    "",
+                    Action::SetConsent(false),
+                ));
+            } else {
+                rows.push(Row::new(
+                    locale.text("Close setup", "关闭听写设置"),
+                    "",
+                    Action::Back,
+                ));
+            }
+        }
+        if !self.setup.testing() {
+            rows.extend([
+                Row::new(
+                    NetworkTarget::ChatGpt.label(locale),
+                    "",
+                    Action::CheckChatGpt,
+                ),
+                Row::new(
+                    locale.text("Proxy", "网络代理"),
+                    if settings.proxy.enabled {
+                        settings.proxy.url.as_str()
+                    } else {
+                        locale.text("Off · direct to chatgpt.com", "已关闭 · 直连 chatgpt.com")
+                    },
+                    Action::Proxy,
+                ),
+            ]);
+        }
+        Menu {
+            kind: MenuKind::Setup,
+            title: locale.text("Dictation setup", "听写设置"),
+            context,
+            query: None,
+            selected: usize::from(settings.cloud_dictation.is_none()),
+            rows,
+        }
+    }
+
+    fn dictionary_work(&mut self, change: Option<Change>) {
+        let current = Config::load_for(self.config.path.clone(), Some(self.locale));
+        if let Err(error) = current
+            .error
+            .map_or_else(|| current.settings.require_dictation(self.locale), Err)
+        {
+            self.setup.dictionary = None;
+            self.setup.dictionary_status = error;
+        } else {
+            self.setup.dictionary(current.settings, self.locale, change);
+        }
+        self.refresh_setup_menu();
+    }
+
+    fn dictionary_menu(&self) -> Menu {
+        let locale = self.locale;
+        let mut rows = vec![Row::new(
+            locale.text("Reload dictionary", "重新加载词典"),
+            "",
+            Action::ReloadDictionary,
+        )];
+        if let Some(dictionary) = &self.setup.dictionary {
+            rows.push(Row::new(
+                locale.text("Add entry", "添加词条"),
+                format!("{} UTF-16", dictionary.max_entry_utf16_units),
+                Action::AddDictionaryEntry,
+            ));
+            rows.extend(dictionary.words.iter().map(|entry| {
+                Row::new(
+                    entry.text.clone(),
+                    locale.text("Enter to review removal", "按 Enter 查看移除选项"),
+                    Action::RemoveDictionaryEntry(entry.id.clone()),
+                )
+            }));
+        }
+        Menu {
+            kind: MenuKind::Dictionary,
+            title: locale.text("ChatGPT Voice Dictionary", "ChatGPT 语音词典"),
+            context: vec![
+                setup::dictionary_disclosure(locale).into(),
+                self.setup.dictionary_status.clone(),
+            ],
+            query: None,
+            selected: 0,
+            rows,
         }
     }
 
@@ -1140,6 +1523,11 @@ impl App {
                     locale.text("Interface language", "界面语言"),
                     self.config.settings.language.label(locale),
                     Action::Language,
+                ),
+                Row::new(
+                    locale.text("Dictation setup", "听写设置"),
+                    "",
+                    Action::Setup,
                 ),
             ],
         }));
@@ -1296,6 +1684,18 @@ impl App {
     }
 
     fn open_provider(&mut self) {
+        let current = Config::load_for(self.config.path.clone(), Some(self.locale));
+        if current.settings.cloud_dictation == Some(true) {
+            self.setup.check_login(current.settings, self.locale);
+        } else {
+            self.setup.login = current
+                .error
+                .unwrap_or_else(|| current.settings.require_dictation(self.locale).unwrap_err());
+        }
+        self.panes.push(Pane::Menu(self.provider_menu()));
+    }
+
+    fn provider_menu(&self) -> Menu {
         let locale = self.locale;
         let mut context = vec![
             locale
@@ -1305,15 +1705,11 @@ impl App {
         match self.config.settings.auth_file(locale) {
             Ok(path) => {
                 context.push(path.display().to_string());
-                context.push(
-                    login_status(&path, locale)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|error| error),
-                );
+                context.push(self.setup.login.clone());
             }
             Err(error) => context.push(error),
         }
-        self.panes.push(Pane::Menu(Menu {
+        Menu {
             kind: MenuKind::Provider,
             title: locale.text("Codex sign-in", "Codex 登录"),
             context,
@@ -1334,7 +1730,7 @@ impl App {
                     Action::ResetAuthPath,
                 ),
             ],
-        }));
+        }
     }
 }
 
@@ -1955,5 +2351,41 @@ mod tests {
 
         let mut release_before_tick = SpaceGesture::Pressing(pressed);
         assert!(release_before_tick.release(pressed + delay, delay));
+    }
+
+    #[test]
+    fn cleanup_updates_only_the_dictated_span_and_keeps_one_undo_step() {
+        for skip in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = App::new(Config::load(directory.path().join("dflow.toml")));
+            app.editor = Editor::from_note("Left right".into(), 5);
+            app.editor.begin();
+            let (session, send) = Session::test_channel();
+            app.dictation = Some(Dictation {
+                session,
+                gesture: SpaceGesture::Toggle,
+                phase: DictationPhase::Finishing,
+                range: 5..5,
+            });
+            send.send(Update::Transcript("raw".into())).unwrap();
+            send.send(Update::Cleaning).unwrap();
+            send.send(Update::Cleaned("cleaned".into())).unwrap();
+            app.tick();
+            assert_eq!(app.editor.text(), "Left raw right");
+            if skip {
+                app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            app.tick();
+            assert_eq!(
+                app.editor.text(),
+                if skip {
+                    "Left raw right"
+                } else {
+                    "Left cleaned right"
+                }
+            );
+            assert!(app.editor.undo());
+            assert_eq!(app.editor.text(), "Left right");
+        }
     }
 }

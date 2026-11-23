@@ -12,15 +12,21 @@ Use a global hotkey to dictate from the tray, or capture, edit, and save text in
 
 Download either or both executables under **Assets** and save them to a writable folder. Choose **DFlow Dictation** (`dflow-dictation.exe`) to dictate to the clipboard or **DFlow Scratchpad** (`dflow.exe`) to dictate into a saved note. [GitHub Releases](https://github.com/DysonFabienSun/dflow-dictation/releases)
 
-Already signed in to Codex CLI with ChatGPT on this PC? DFlow uses that login. To sign in for the first time or renew the session, run `codex login` and complete the browser sign-in with your ChatGPT account. [OpenAI's Codex sign-in guide](https://learn.chatgpt.com/docs/auth)
+For cloud dictation, install Codex CLI, run `codex login` with your ChatGPT account, and allow Windows microphone access. DFlow uses the existing file-backed Codex sign-in. Keep a current Codex CLI on PATH to use automatic cleanup. [OpenAI's Codex sign-in guide](https://learn.chatgpt.com/docs/auth)
 
 When upgrading, close both apps before replacing the executables. Keep the `config` and `cache` folders to preserve your settings and saved note. If you used `dflow-tray.exe`, launch `dflow-dictation.exe` instead and re-enable **Start with Windows** in its Settings if you used that option.
 
 ## Quick start
 
+On the first interactive launch, including an upgrade from a version without consent settings, choose **Enable cloud dictation** or **Continue without dictation**. Enabling uses your existing Codex sign-in and sends microphone audio to OpenAI at `chatgpt.com`. You can use the scratchpad for local editing after declining.
+
+In **Dictation setup**, check the sign-in, select a microphone, and configure a proxy if needed. The proxy starts disabled. Select **Test dictation**, speak, and stop the test to see its transcript in setup. You can skip the test. Its transcript stays out of the note and clipboard.
+
+Before enabling dictation, use **Check ChatGPT availability** to check the connection to `chatgpt.com` and whether DFlow can find Codex CLI. **Check proxy** tests the entered address even when the proxy is off. Use **Test dictation** after enabling to verify account access.
+
 ### DFlow Dictation (`dflow-dictation.exe`)
 
-1. Launch `dflow-dictation.exe`. The tray app shows a seven-second shortcut guide. Select **Dismiss** to close it early, or turn off **Show startup tip** in **Settings**. Use the tray icon to open **Settings** or choose **Copy last transcript**.
+1. Launch `dflow-dictation.exe`. With dictation enabled, the tray app shows a seven-second shortcut guide. Select **Dismiss** to close it early, or turn off **Show startup tip** in **Settings**. Use the tray icon to open **Settings** or choose **Copy last transcript**.
 2. Press **Ctrl+Shift+/** to start dictation. The default shortcut uses the slash/question-mark key on a US keyboard. The live preview appears as soon as words are ready and grows to fit up to three lines.
 3. Press the shortcut again within two seconds to discard the recording. After two seconds, press it to stop and copy the full transcript when it’s ready. You can also click **Cancel** or **Stop & Copy** above the live preview. Use **Cancel recording** in the tray menu to discard at any time.
 
@@ -36,9 +42,9 @@ DFlow underlines the latest dictation, paste, or text supplied by an agent. The 
 
 ## Settings
 
-Keep both executables in one folder to share microphone, Codex auth, and proxy settings. DFlow creates `config/dflow.toml` beside the executable when you save a setting. Use separate folders for independent settings.
+Keep both executables in one folder to share consent, microphone, Codex auth, proxy, and cleanup settings. DFlow creates `config/dflow.toml` beside the executable when you save a setting. Use separate folders for independent settings.
 
-Change shared settings in the tray's **Settings** dialog or the scratchpad's `/settings` menu. The tray reads the shared dictation settings before each recording. Restart the scratchpad after changing shared settings in the tray or editing the file directly.
+Reopen **Dictation setup** from the tray menu or the scratchpad's `/settings` menu to change consent or run another test. Both apps read the shared dictation settings before recording. Reopen settings after a change in another app.
 
 Use **Interface language** in either app’s settings to follow the system language or select English or Simplified Chinese. The preference takes effect when you restart an app. The config file accepts `auto`, `en`, and `zh-CN` for `language` under `[ui]`.
 
@@ -47,6 +53,18 @@ Use **Interface language** in either app’s settings to follow the system langu
 - **`/proxy`** configures an optional proxy for dictation. It starts disabled with a saved address of `http://127.0.0.1:10808`. Use `/proxyon` or `/proxyoff` to switch for the next dictation. Supported URLs use `http://`, `https://`, or `socks5://` with a host and optional port.
 
 The scratchpad's push-to-talk threshold defaults to one second. To shorten it, set `hold_delay_ms = 250` under `[audio]` in the config file and restart the scratchpad.
+
+## ChatGPT Voice Dictionary and cleanup
+
+Open **ChatGPT Voice Dictionary** in Dictation setup to view, add, or remove canonical words and phrases. These edits also affect dictation in ChatGPT. The service supplies the entry count and length limits.
+
+**Clean up after dictation** starts off. When enabled, DFlow sends the completed dictated span and account vocabulary to GPT-6 Luna through Codex App Server. The scratchpad keeps surrounding note text local and groups capture and cleanup into one undo step.
+
+Each cleanup runs one GPT-6 Luna request and uses additional tokens from your ChatGPT plan’s Codex allowance. The amount varies with the transcript and vocabulary. Applicable credits or billing may apply. [Codex usage and billing](https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan)
+
+While **Cleaning up** is visible, press **Esc** in the scratchpad or select **Skip cleanup** in the tray to keep the raw transcript. DFlow also keeps the raw transcript if cleanup fails or reaches its 12-second deadline. The tray copies the final result once.
+
+Transcription and Voice Dictionary management use private ChatGPT endpoints. Availability depends on ChatGPT account access, and endpoint or authentication changes can interrupt these features.
 
 ## Connect a local agent
 
