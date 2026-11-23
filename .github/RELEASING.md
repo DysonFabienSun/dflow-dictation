@@ -22,4 +22,4 @@ pwsh -NoProfile -File .github/release-doc-links.ps1 -Tag vX.Y.Z
 
 Keep the version preparation commit limited to `Cargo.toml` and `Cargo.lock`. Confirm the chosen tag matches both. Create an annotated tag from the English Markdown file with `--cleanup=verbatim --file` so Git preserves the headings.
 
-The Windows release workflow checks out the tagged revision, verifies its annotation and docs, and creates a draft with the two executable assets. The draft links directly to the changelog entry and installation instructions at that revision. Check the draft contents and links before publishing.
+The Windows release workflow checks out the tagged revision, verifies its annotation and docs, and creates or refreshes a draft with the two executable assets. The draft links directly to the changelog entry and installation instructions at that revision. Check the draft contents and links before publishing.

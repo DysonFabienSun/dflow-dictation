@@ -70,7 +70,7 @@ jobs:
           cargo build --locked --release --bins
           if ($LASTEXITCODE -ne 0) { throw 'Cargo release build failed.' }
 
-      - name: Create a draft release with both apps and setup instructions
+      - name: Prepare the draft release with both apps and setup instructions
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -82,5 +82,16 @@ jobs:
             }
           }
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-          gh release create "$env:RELEASE_TAG" @executables --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
-          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }
+          $existing = gh release view "$env:RELEASE_TAG" --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if (!(($existing | ConvertFrom-Json).isDraft)) {
+              throw 'A published release already exists for this tag.'
+            }
+            gh release upload "$env:RELEASE_TAG" @executables --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the draft executables.' }
+            gh release edit "$env:RELEASE_TAG" --notes-file "$notesFile"
+            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the draft release notes.' }
+          } else {
+            gh release create "$env:RELEASE_TAG" @executables --title "DFlow $env:RELEASE_TAG" --notes-file "$notesFile" --verify-tag --draft
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release.' }
+          }

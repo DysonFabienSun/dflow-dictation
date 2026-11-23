@@ -30,7 +30,7 @@ Before enabling dictation, use **Check ChatGPT availability** to check the conne
 2. Press **Ctrl+Shift+/** to start dictation. The default shortcut uses the slash/question-mark key on a US keyboard. The live preview appears as soon as words are ready and grows to fit up to three lines.
 3. Tap the shortcut again within two seconds to discard the recording. After two seconds, tap it to stop and copy the full transcript when it’s ready. You can also click **Cancel** or **Stop & Copy** above the live preview. To discard an active recording, hold the shortcut or the top-right preview button for 750 ms. The orange bar shows how long you’ve held it.
 
-Paste the transcript into any app with **Ctrl+V**. Select **Copy last transcript** above the preview or in the tray menu to copy the most recently completed transcript, including while another recording is in progress. In **Settings**, you can change the shortcut or enable **Start with Windows**.
+Paste the transcript into any app with **Ctrl+V**. To start another recording while **COPIED** is visible, press the dictation shortcut. Select **Copy last transcript** above the preview or in the tray menu to copy the most recently completed transcript, including while another recording is in progress. In **Settings**, you can change the shortcut or enable **Start with Windows**.
 
 ### DFlow Scratchpad (`dflow.exe`)
 
