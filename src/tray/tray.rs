@@ -202,12 +202,7 @@ impl PreviewBadge {
             Self::Holding => locale.text("Hold to abort", "长按取消听写"),
         };
         match hotkey {
-            Some(hotkey)
-                if matches!(
-                    self,
-                    Self::Cancel | Self::Stop | Self::SkipCleanup | Self::Copied
-                ) =>
-            {
+            Some(hotkey) if matches!(self, Self::Cancel | Self::Stop | Self::SkipCleanup) => {
                 format!("{label} · {}", hotkey.to_string().to_ascii_uppercase())
             }
             _ => label.into(),
@@ -2449,10 +2444,26 @@ mod tests {
             }
             app.tick();
             assert_eq!(app.completed_preview, Some(PreviewBadge::Copied));
+            let length = GetWindowTextW(shortcut, title.as_mut_ptr(), title.len() as i32);
+            assert_eq!(
+                String::from_utf16_lossy(&title[..length as usize]),
+                "COPIED"
+            );
             assert_eq!(
                 GetWindowLongPtrW(app.copy_shortcut, SHORTCUT_COPY_READY_SLOT),
                 1
             );
+            let previous_id = app.recording_id;
+            app.path = tempfile::tempdir()
+                .unwrap()
+                .path()
+                .join("config/dflow.toml");
+            app.dictation_key_pressed();
+            assert!(app.recording.is_some());
+            assert_eq!(app.recording_id, previous_id + 1);
+            assert!(app.completed_preview.is_none());
+            assert!(app.status_until.is_none());
+            app.cancel_recording();
             app.hide();
             assert_eq!(IsWindowVisible(app.copy_shortcut), 0);
             app.indicator("Listening…", Some(PreviewBadge::Listening));
