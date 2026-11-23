@@ -54,6 +54,7 @@ const PROGRESS_CYCLE_MS: isize = 1100;
 const TICK_MS: u32 = 30;
 const PILL_WELCOME_SLOT: i32 = size_of::<isize>() as i32;
 const PILL_BADGE_SLOT: i32 = PILL_WELCOME_SLOT + size_of::<isize>() as i32;
+const SHORTCUT_COPY_READY_SLOT: i32 = size_of::<isize>() as i32;
 const TIMER: usize = 1;
 const SETTINGS: u32 = 1;
 const CANCEL: u32 = 2;
@@ -921,7 +922,7 @@ fn create_preview_shortcut(pill: HWND) -> HWND {
     let class = wide("DFlowPreviewShortcut");
     let window_class = WNDCLASSW {
         lpfnWndProc: Some(preview_shortcut_proc),
-        cbWndExtra: size_of::<isize>() as i32,
+        cbWndExtra: 2 * size_of::<isize>() as i32,
         hInstance: instance(),
         lpszClassName: class.as_ptr(),
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_HAND) },
@@ -1031,6 +1032,8 @@ fn draw_preview_shortcut(hwnd: HWND, dc: HDC) {
         let contrast = high_contrast();
         let accent = if contrast {
             highlight
+        } else if copy_button && GetWindowLongPtrW(hwnd, SHORTCUT_COPY_READY_SLOT) != 0 {
+            rgb(54, 98, 172)
         } else {
             badge.accent().unwrap_or(highlight)
         };
@@ -1488,7 +1491,7 @@ impl App {
         );
         self.last_transcript = Some(recording.transcript);
         self.indicator(&preview, self.completed_preview);
-        for hwnd in [self.pill, self.preview_shortcut] {
+        for hwnd in [self.pill, self.preview_shortcut, self.copy_shortcut] {
             if !hwnd.is_null() {
                 unsafe { UpdateWindow(hwnd) };
             }
@@ -1767,6 +1770,14 @@ impl App {
         self.show_preview_shortcut(shortcut, left + width, top, dpi);
         if !self.copy_shortcut.is_null() {
             if self.last_transcript.is_some() {
+                let ready = self.completed_preview.is_some() as isize;
+                unsafe {
+                    if SetWindowLongPtrW(self.copy_shortcut, SHORTCUT_COPY_READY_SLOT, ready)
+                        != ready
+                    {
+                        InvalidateRect(self.copy_shortcut, null(), 0);
+                    }
+                }
                 self.position_preview_shortcut(
                     self.copy_shortcut,
                     PreviewBadge::CopyLast,
@@ -2183,6 +2194,17 @@ mod tests {
                 assert!((inset..edge).all(|x| GetPixel(dc, x, y) == copy_accent));
                 assert_ne!(GetPixel(dc, edge, y), copy_accent);
             }
+            SetWindowLongPtrW(shortcut, SHORTCUT_COPY_READY_SLOT, 1);
+            SendMessageW(shortcut, WM_PRINTCLIENT, dc as WPARAM, 0);
+            let ready_accent = GetPixel(dc, GetSystemMetricsForDpi(SM_CXBORDER, 144), y);
+            if high_contrast() {
+                assert_eq!(ready_accent, copy_accent);
+            } else {
+                assert_ne!(ready_accent, copy_accent);
+                assert_ne!(Some(ready_accent), PreviewBadge::Copied.accent());
+                assert_eq!(GetPixel(dc, 20, y), blend_color(face, ready_accent, 2));
+            }
+            SetWindowLongPtrW(shortcut, SHORTCUT_COPY_READY_SLOT, 0);
             for badge in [
                 PreviewBadge::Transcribing,
                 PreviewBadge::SkipCleanup,
@@ -2305,7 +2327,7 @@ mod tests {
 
             let pill = create_pill(parent);
             assert!(!pill.is_null());
-            let (clipboard, _writes, _feedback) = Clipboard::test_sink();
+            let (clipboard, _writes, feedback) = Clipboard::test_sink();
             let hotkey = "Ctrl+Shift+F2".parse().unwrap();
             let mut app = App {
                 locale: Locale::English,
@@ -2361,7 +2383,7 @@ mod tests {
 
             assert_eq!(IsWindowVisible(app.copy_shortcut), 0);
             app.last_transcript = Some("Previous transcript.".into());
-            let (session, _updates) = Session::test_channel();
+            let (session, updates) = Session::test_channel();
             app.recording = Some(Recording {
                 session,
                 started_at: Instant::now(),
@@ -2401,9 +2423,44 @@ mod tests {
             assert_eq!(preview_top - copy.bottom, scale_preview(SHORTCUT_GAP, dpi));
             assert!(copy.right < stop.left);
             assert_eq!(IsWindowVisible(app.copy_shortcut), 1);
-            app.recording = None;
+            for update in [Update::Finishing, Update::Cleaning] {
+                updates.send(update).unwrap();
+                app.tick();
+                assert_eq!(
+                    GetWindowLongPtrW(app.copy_shortcut, SHORTCUT_COPY_READY_SLOT),
+                    0
+                );
+            }
+            updates
+                .send(Update::Cleaned("Cleaned transcript.".into()))
+                .unwrap();
+            app.tick();
+            assert_eq!(app.completed_preview, Some(PreviewBadge::Copying));
+            assert_eq!(
+                GetWindowLongPtrW(app.copy_shortcut, SHORTCUT_COPY_READY_SLOT),
+                1
+            );
+            assert_eq!(
+                GetWindowLongPtrW(app.copy_shortcut, GWLP_USERDATA),
+                PreviewBadge::CopyLast as isize
+            );
+            for _ in 0..2 {
+                feedback.send(ClipboardFeedback::Copied(1)).unwrap();
+            }
+            app.tick();
+            assert_eq!(app.completed_preview, Some(PreviewBadge::Copied));
+            assert_eq!(
+                GetWindowLongPtrW(app.copy_shortcut, SHORTCUT_COPY_READY_SLOT),
+                1
+            );
             app.hide();
             assert_eq!(IsWindowVisible(app.copy_shortcut), 0);
+            app.indicator("Listening…", Some(PreviewBadge::Listening));
+            assert_eq!(
+                GetWindowLongPtrW(app.copy_shortcut, SHORTCUT_COPY_READY_SLOT),
+                0
+            );
+            app.hide();
 
             let mut area = RECT::default();
             app.show_preview_shortcut(Some(PreviewBadge::Stop), 560, 100, 96);
