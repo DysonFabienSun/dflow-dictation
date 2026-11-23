@@ -28,7 +28,7 @@ const MAX_CHUNK_SECONDS: usize = 7;
 const MIN_CHUNK_MS: usize = 1_000;
 const PAUSE_MS: usize = 350;
 const SPEECH_FRAME_MS: usize = 20;
-const FINAL_SPEECH_MIN_MS: usize = 60;
+const MIN_SUSTAINED_SPEECH_MS: usize = 60;
 const MIN_SPEECH_ENERGY: f32 = 0.00001;
 const QUIET_FOR: Duration = Duration::from_secs(5);
 const MIN_AUDIO_PEAK: f32 = 0.001;
@@ -519,7 +519,7 @@ impl Chunker {
         if self.samples.len() >= self.rate * MIN_CHUNK_MS / 1_000 {
             let trailing_pause = self.samples.len() - pause_samples;
             if !has_speech(&self.samples[trailing_pause..], self.rate) {
-                if has_speech(&self.samples[..trailing_pause], self.rate) {
+                if has_sustained_speech(&self.samples[..trailing_pause], self.rate) {
                     self.flush(queue)?;
                 } else {
                     // Keep a little audio before the next onset.
@@ -537,13 +537,7 @@ impl Chunker {
     }
 
     fn finish(&mut self, queue: &SyncSender<Vec<i16>>) -> Result<(), String> {
-        // A shortcut click can trip one energy frame in an otherwise quiet tail.
-        let required = self.rate * FINAL_SPEECH_MIN_MS / 1_000;
-        let mut voiced = 0;
-        if speech_frames(&self.samples, self.rate).any(|(active, len)| {
-            voiced = if active { voiced + len } else { 0 };
-            voiced >= required
-        }) {
+        if has_sustained_speech(&self.samples, self.rate) {
             self.flush(queue)?;
         }
         Ok(())
@@ -580,6 +574,16 @@ fn send_chunk(
 
 fn has_speech(samples: &[f32], rate: usize) -> bool {
     speech_frames(samples, rate).any(|(active, _)| active)
+}
+
+fn has_sustained_speech(samples: &[f32], rate: usize) -> bool {
+    // A lip smack or shortcut click can span an energy frame or two.
+    let required = rate * MIN_SUSTAINED_SPEECH_MS / 1_000;
+    let mut voiced = 0;
+    speech_frames(samples, rate).any(|(active, len)| {
+        voiced = if active { voiced + len } else { 0 };
+        voiced >= required
+    })
 }
 
 fn speech_frames(samples: &[f32], rate: usize) -> impl Iterator<Item = (bool, usize)> {
@@ -708,6 +712,32 @@ mod tests {
         assert!(output.try_recv().is_err());
         chunker.push(vec![0.5], &queue).unwrap();
         assert_eq!(output.try_recv().unwrap().len(), rate * 7);
+    }
+
+    #[test]
+    fn pause_drops_a_loud_transient_and_keeps_the_next_short_utterance() {
+        let rate = WAV_RATE as usize;
+        let (queue, output) = mpsc::sync_channel(2);
+        let mut chunker = Chunker::new(rate, Locale::English);
+        let mut noise = vec![0.0; rate];
+        // The transient crosses two 20 ms frames before the pause.
+        noise[rate * 459 / 1_000..rate * 470 / 1_000].fill(0.5);
+        assert!(has_speech(&noise, rate));
+        chunker.push(noise, &queue).unwrap();
+        assert!(matches!(output.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        let mut utterance = vec![0.0; rate * 650 / 1_000];
+        utterance[..rate / 5].fill(0.03);
+        chunker.push(utterance, &queue).unwrap();
+        let pcm = output.try_recv().unwrap();
+        assert_eq!(pcm.len(), rate);
+        let pre_roll = rate * PAUSE_MS / 1_000;
+        assert!(pcm[..pre_roll].iter().all(|&sample| sample == 0));
+        assert!(
+            pcm[pre_roll..pre_roll + rate / 5]
+                .iter()
+                .all(|&sample| sample > 0)
+        );
     }
 
     #[test]
